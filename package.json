@@ -1,0 +1,12 @@
+{
+  "name": "ctxtree",
+  "version": "0.1.0",
+  "description": "WizTree for the context window - scan, see, and reclaim what your Claude Code sessions are spending tokens on.",
+  "type": "module",
+  "bin": { "ctxtree": "./bin/ctxtree.js" },
+  "engines": { "node": ">=18" },
+  "files": ["bin", "src", "ui"],
+  "scripts": { "start": "node bin/ctxtree.js" },
+  "license": "MIT",
+  "private": true
+}

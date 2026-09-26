@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ctxtree - WizTree for the Context Window</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Window Title Bar -->
+    <header class="win-titlebar">
+      <div class="win-title">
+        <span class="win-icon">🌳</span>
+        <span id="window-title-text">[All Sessions] - ctxtree</span>
+      </div>
+      <div class="win-controls">
+        <span class="win-btn win-min">─</span>
+        <span class="win-btn win-max">□</span>
+        <span class="win-btn win-close">✕</span>
+      </div>
+    </header>
+
+    <!-- Menu Bar -->
+    <nav class="win-menubar">
+      <div class="menu-item" id="menu-file">File</div>
+      <div class="menu-item" id="menu-view">View</div>
+      <div class="menu-item" id="menu-options">Options</div>
+      <div class="menu-item" id="menu-help">Help</div>
+    </nav>
+
+    <!-- Top Control Bar (WizTree style) -->
+    <section class="top-controls">
+      <div class="select-row">
+        <label for="session-select">Select:</label>
+        <div class="select-wrapper">
+          <select id="session-select">
+            <option value="all">&lt;All Sessions / Overview&gt;</option>
+          </select>
+        </div>
+        <button id="btn-scan" class="wiz-btn primary">Scan</button>
+        <span id="scan-status" class="scan-status">Scan complete in 0.95 seconds</span>
+      </div>
+
+      <div class="stats-banner">
+        <div class="stats-details">
+          <div class="stat-line">
+            <span class="stat-label">Selection:</span>
+            <span id="stat-selection" class="stat-val">&lt;All Sessions&gt;</span>
+          </div>
+          <div class="stat-line">
+            <span class="stat-label">Total Allocated:</span>
+            <span id="stat-allocated" class="stat-val">2.77 B (Tokens × Turns)</span>
+          </div>
+          <div class="stat-line">
+            <span class="stat-label">Distinct Size:</span>
+            <span id="stat-size" class="stat-val">31.9 M</span>
+            <span class="stat-sep">|</span>
+            <span class="stat-label">Headroom / Compacts:</span>
+            <span id="stat-compacts" class="stat-val">52 ceiling hits</span>
+          </div>
+        </div>
+
+        <div class="meter-col">
+          <div class="meter-text">
+            <span>Context Utilization</span>
+            <span id="meter-percent">71.2%</span>
+          </div>
+          <div class="meter-bar-container">
+            <div id="meter-bar-fill" class="meter-bar-fill" style="width: 71.2%;"></div>
+          </div>
+        </div>
+
+        <div class="brand-badge">
+          <div class="badge-title">ctxtree v0.1.0</div>
+          <div class="badge-sub">WizTree for LLM Context</div>
+          <div class="badge-reclaim" id="badge-reclaim">52.4M reclaimable</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Workspace Splitter (Tree + Panels) -->
+    <main class="workspace">
+      <!-- Upper Section: Left Tree + Right Kind/Reclaim Panels -->
+      <section class="upper-workspace">
+        <!-- Left Panel: Tree View -->
+        <div class="panel left-panel">
+          <div class="panel-tabs">
+            <button class="tab-btn active" data-tab="tree-tab">Tree View</button>
+            <button class="tab-btn" data-tab="regions-tab">Prompt Regions</button>
+            <button class="tab-btn" data-tab="forks-tab">Forks / Lineage <span id="forks-count-badge" class="badge">0</span></button>
+          </div>
+
+          <!-- Tree View Tab Content -->
+          <div id="tree-tab" class="tab-content active">
+            <div class="table-container">
+              <table class="wiz-table" id="tree-table">
+                <thead>
+                  <tr>
+                    <th class="col-name">Category / Component</th>
+                    <th class="col-pct">% of Parent</th>
+                    <th class="col-size">Size (tok)</th>
+                    <th class="col-alloc">Allocated</th>
+                    <th class="col-items">Items</th>
+                  </tr>
+                </thead>
+                <tbody id="tree-tbody">
+                  <!-- Generated tree rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Regions Tab Content -->
+          <div id="regions-tab" class="tab-content">
+            <div class="table-container">
+              <table class="wiz-table" id="regions-table">
+                <thead>
+                  <tr>
+                    <th class="col-name">User Prompt Region</th>
+                    <th class="col-pct">% Session</th>
+                    <th class="col-size">Size (tok)</th>
+                    <th class="col-alloc">Allocated</th>
+                    <th class="col-items">Chunks</th>
+                  </tr>
+                </thead>
+                <tbody id="regions-tbody">
+                  <!-- Generated regions rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Forks Tab Content -->
+          <div id="forks-tab" class="tab-content">
+            <div class="table-container">
+              <table class="wiz-table" id="forks-table">
+                <thead>
+                  <tr>
+                    <th>Fork Session ID</th>
+                    <th>Project</th>
+                    <th>Saved Tok</th>
+                    <th>Date</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="forks-tbody">
+                  <!-- Generated forks rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Panel: By Kind & Reclaim Findings -->
+        <div class="panel right-panel">
+          <div class="panel-tabs">
+            <button class="tab-btn active" data-tab="reclaim-tab">Reclaim Findings <span id="findings-count-badge" class="badge alert">0</span></button>
+            <button class="tab-btn" data-tab="kind-tab">By Kind / Type</button>
+            <button class="tab-btn" data-tab="projects-tab">By Project</button>
+          </div>
+
+          <!-- Reclaim Tab -->
+          <div id="reclaim-tab" class="tab-content active">
+            <div class="reclaim-toolbar">
+              <div class="reclaim-summary">
+                Selected savings: <strong id="reclaim-selected-savings">0 tokens</strong>
+              </div>
+              <button id="btn-prune-selected" class="wiz-btn danger" disabled>
+                ✂ Tombstone & Fork Session
+              </button>
+            </div>
+            <div class="findings-scroll" id="findings-container">
+              <!-- Rendered findings items -->
+            </div>
+          </div>
+
+          <!-- By Kind Tab (WizTree Extensions equivalent) -->
+          <div id="kind-tab" class="tab-content">
+            <div class="table-container">
+              <table class="wiz-table" id="kind-table">
+                <thead>
+                  <tr>
+                    <th style="width: 32px;"></th>
+                    <th>Kind / Subsystem</th>
+                    <th>Percent</th>
+                    <th>Size (tok)</th>
+                    <th>Allocated</th>
+                    <th>Chunks</th>
+                  </tr>
+                </thead>
+                <tbody id="kind-tbody">
+                  <!-- Generated kinds rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- By Project Tab -->
+          <div id="projects-tab" class="tab-content">
+            <div class="table-container">
+              <table class="wiz-table" id="projects-table">
+                <thead>
+                  <tr>
+                    <th>Project</th>
+                    <th>Percent</th>
+                    <th>Size (tok)</th>
+                    <th>Allocated</th>
+                    <th>Sessions</th>
+                  </tr>
+                </thead>
+                <tbody id="projects-tbody">
+                  <!-- Generated projects rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Lower Section: Treemap Visualizer -->
+      <section class="treemap-section">
+        <div class="treemap-header">
+          <div class="treemap-breadcrumb" id="treemap-breadcrumb">
+            <span class="crumb active" data-level="root">[All Context]</span>
+          </div>
+          <div class="treemap-tools">
+            <span class="tool-label">Metric:</span>
+            <button class="metric-btn active" id="metric-alloc">Allocated (Tokens × Turns)</button>
+            <button class="metric-btn" id="metric-size">Distinct Size</button>
+            <button class="wiz-btn small" id="btn-zoom-reset">Reset Zoom</button>
+          </div>
+        </div>
+
+        <div class="treemap-canvas-wrapper" id="treemap-container">
+          <canvas id="treemap-canvas"></canvas>
+          <div id="treemap-tooltip" class="wiz-tooltip hidden"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Prune Modal -->
+    <div id="prune-modal" class="modal-overlay hidden">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>Tombstone Context & Fork Session</h3>
+          <button class="modal-close" id="modal-close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <p id="modal-desc">
+            You are about to tombstone <strong id="modal-chunk-count">0</strong> tool results.
+          </p>
+          <div class="savings-box">
+            <div>Tokens Reclaimed: <strong id="modal-tok-saved">0</strong></div>
+            <div>Shipped Tokens Saved: <strong id="modal-alloc-saved">0</strong></div>
+          </div>
+          <p class="modal-note">
+            This will create a new session file in-place and copy its file-history via fast copy-on-write clone. The original session remains completely untouched.
+          </p>
+          <div class="input-group">
+            <label for="prune-note">Note / Label:</label>
+            <input type="text" id="prune-note" placeholder="e.g. Cleaned up fat tool reads">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="wiz-btn" id="modal-cancel-btn">Cancel</button>
+          <button class="wiz-btn danger" id="modal-confirm-btn">Confirm & Fork</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Resume Command Modal (Success) -->
+    <div id="success-modal" class="modal-overlay hidden">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>Session Forked Successfully!</h3>
+          <button class="modal-close" id="success-close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="success-icon">✨</div>
+          <p>Your session has been pruned and forked to a fresh context.</p>
+          <label>Resume Command (Click to copy):</label>
+          <div class="cmd-box" id="success-cmd-box">
+            <code id="success-cmd-text">claude --resume ...</code>
+            <button class="wiz-btn small" id="btn-copy-cmd">Copy</button>
+          </div>
+          <div class="savings-box">
+            <div>Tokens Saved: <strong id="success-tok-saved">0</strong></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="wiz-btn primary" id="success-done-btn">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
