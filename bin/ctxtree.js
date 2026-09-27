@@ -5,6 +5,7 @@ import os from 'node:os';
 import { CtxServer } from '../src/server.js';
 import { build } from '../src/model.js';
 import { findings } from '../src/findings.js';
+import { getSessionContext } from '../src/sessionEditor.js';
 
 const args = process.argv.slice(2);
 
@@ -20,6 +21,7 @@ Options:
   -p, --port <port>    Port to listen on (default: 3888)
   --no-open            Do not automatically open browser
   --scan-only, --cli   Scan history, print terminal report and exit
+  --context [sid]      Inspect paragraphs, prompt regions, and continuity anchors
   -h, --help           Show this help message
 `);
   process.exit(0);
@@ -84,6 +86,58 @@ Top 5 Bloated Sessions:`);
     console.log(`  ${s.sid.slice(0, 8)} | ${s.projectName.padEnd(25)} | Size: ${fmt(s.tok).padStart(6)} | Alloc: ${fmt(s.alloc).padStart(7)} | Turns: ${String(s.turns).padStart(4)}`);
   }
   console.log('=============================================================\n');
+  process.exit(0);
+}
+
+const ctxIdx = args.findIndex(a => a === '--context');
+if (ctxIdx !== -1) {
+  const model = build();
+  let targetSid = args[ctxIdx + 1];
+  if (!targetSid || targetSid.startsWith('-')) {
+    targetSid = model.sessions[0]?.sid;
+  } else {
+    // fuzzy match prefix
+    const found = model.sessions.find(s => s.sid.startsWith(targetSid));
+    if (found) targetSid = found.sid;
+  }
+
+  if (!targetSid) {
+    console.error('No matching session found.');
+    process.exit(1);
+  }
+
+  const ctx = getSessionContext(targetSid, model);
+  console.log(`
+=============================================================
+  ctxtree - Context Surgeon Audit: [${ctx.sid.slice(0, 8)}] ${ctx.projectName}
+=============================================================
+  Total Turns      : ${ctx.totalTurns}
+  Total Paragraphs : ${ctx.totalBlocks}
+  Total Tokens     : ${fmt(ctx.totalTokens)} tok
+  Total Allocated  : ${fmt(ctx.totalAlloc)} (x turns resident)
+  Prompt Milestones: ${ctx.regions.length}
+
+PROMPT REGIONS:`);
+
+  ctx.regions.slice(0, 6).forEach((r, i) => {
+    console.log(`  [Region ${i + 1}] "${r.prompt.slice(0, 60)}" (Turn ${r.turn} · ${fmt(r.tok)} tok · ${r.blocksCount} items)`);
+  });
+
+  const heavyBlocks = ctx.blocks.filter(b => b.tok >= 2000).sort((a, b) => b.tok - a.tok);
+  console.log(`\nHEAVY PARAGRAPHS & CONTINUITY ANCHORS (${heavyBlocks.length} items >= 2k tok):`);
+  heavyBlocks.slice(0, 6).forEach(b => {
+    const risk = b.continuity.riskLevel === 'high' ? '🔴 HIGH RISK' : (b.continuity.riskLevel === 'medium' ? '🟡 ANCHOR' : '🟢 SAFE');
+    console.log(`  • [${fmt(b.tok).padStart(6)} tok] Turn ${String(b.turn).padStart(3)} | ${b.role}:${b.tool || b.kind} | ${risk} | ${(b.target || '').slice(0, 40)}`);
+    if (b.continuity.downstreamCount > 0) {
+      console.log(`    ↳ Downstream refs: ${b.continuity.downstreamRefs.map(r => r.term + ' (turn ' + r.turn + ')').join(', ')}`);
+    }
+    console.log(`    ↳ Smart Bridge: ${b.suggestedBridge.slice(0, 80)}...`);
+  });
+
+  console.log(`
+To edit these paragraphs interactively with real-time continuity checking:
+  Run: npx ctxtree
+=============================================================\n`);
   process.exit(0);
 }
 

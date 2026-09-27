@@ -7,6 +7,7 @@ import { buildTree, projectBreakdown } from './tree.js';
 import { buildRegions } from './regions.js';
 import { findings } from './findings.js';
 import { pruneSession, getLineage, revertFork } from './prune.js';
+import { getSessionContext, saveEditedSessionContext } from './sessionEditor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -283,6 +284,32 @@ export class CtxServer {
         const resData = revertFork(forkSid);
         setTimeout(() => this.ensureModel(true), 100);
         return sendJson(resData);
+      }
+
+      if (pathname === '/api/context' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid) return sendJson({ error: 'Missing sid' }, 400);
+        try {
+          const ctxData = getSessionContext(sid, model);
+          return sendJson(ctxData);
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
+      }
+
+      if (pathname === '/api/context/save' && method === 'POST') {
+        const body = await readBody();
+        const { sid, edits, note } = body;
+        if (!sid || !edits || !edits.length) {
+          return sendJson({ error: 'sid and edits are required' }, 400);
+        }
+        try {
+          const resData = await saveEditedSessionContext({ sid, edits, note }, model);
+          setTimeout(() => this.ensureModel(true), 100);
+          return sendJson(resData);
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
       }
 
       if (pathname === '/api/refresh' && method === 'POST') {

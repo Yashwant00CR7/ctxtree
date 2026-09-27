@@ -1,40 +1,48 @@
 # ctxtree 🌳
 
-> **WizTree for the LLM Context Window** — Scan, see, and reclaim what your Claude Code sessions are spending tokens on.
+> **Context Surgeon & WizTree Visualizer for the LLM Context Window** — Edit paragraph contexts with surgical precision, eliminate continuity jumps, and reclaim wasted tokens across your Claude Code sessions.
 
 ---
 
-## The Problem
+## The Core Purpose: Jump-Free Context Surgery
 
-Long LLM coding sessions silently accumulate millions of tokens. A single large file read or bash output doesn't just cost tokens once — it rides in context for dozens or hundreds of turns, multiplying its spend every single API roundtrip. Unused MCP servers ship dozens of tool schemas on turn 0 that never get called. Eventually you hit context auto-compaction, losing critical reasoning history.
+Long LLM coding sessions accumulate massive amounts of token bloat: 50k file reads, repetitive command outputs, failed debugging rabbit holes, and redundant dialogue. 
 
-**ctxtree** brings the instant clarity of [WizTree](https://diskanalyzer.com/) to LLM context management: **Scan → See → Select → Cut → Resume smaller.**
+However, **blindly deleting or wiping chunks breaks the narrative flow ("creates jumps")**. In future turns or when resuming, the assistant gets confused, loses critical variable names or file structures, and either re-reads the entire file or asks repetitive questions.
 
-![WizTree Anatomy](https://raw.githubusercontent.com/Yashwant00CR7/ctxtree/main/docs/wiztree_concept.png)
+**ctxtree solves this fundamentally**:
+- **See the Bloat**: WizTree-style interactive squarified treemap & lever tree showing where tokens are concentrated.
+- **Granular Paragraph Editor**: Click any card in the chronological narrative stream to edit user prompts, assistant reasoning, or tool outputs directly.
+- **Continuity Bridge Engine**: Automatically detects downstream references (e.g. `server.go` referenced in turn 24) and generates seamless semantic bridges so your next session continues with **zero jumps**.
+- **Region Synthesizer**: Condense a 15-turn debugging detour into a single clean milestone.
+- **In-Place Fork & Resume**: Non-destructively forks the session with fast APFS copy-on-write clone (`cp -c -R`), outputting the exact `claude --resume <fork-uuid>` command.
 
 ---
 
 ## Features
 
-- **⚡ Blazing Fast Scanner**: Scans your entire Claude Code history (`~/.claude/projects/`, 150MB+ across 60+ sessions) in **under 1.0 second**.
-- **📊 Dual Measurement**:
-  - **Distinct Size**: Raw tokens of a chunk.
-  - **Allocated**: `Size × turns resident` — reveals the true token cost of early commands that ride along for the rest of the conversation. Anchored to ground-truth token accounting.
-- **🎨 Interactive Treemap**: Squarified treemap rendering nested rectangles sized by allocated tokens with WizTree-style 3D bevels, instant hover tooltips, and drill-down navigation.
-- **📁 Lever Tree**: Groups context by actionable subsystems rather than arbitrary byte buckets:
-  - `boot overhead` (Tool schemas, system prompt, skill listings, MCP instructions)
-  - `tool results` (Read, Bash, Edit, Glob, Grep)
-  - `conversation` (User prompts, assistant responses, thinking)
-  - `subagent contexts` (Sidechains and agent forks)
-- **💬 Prompt Regions**: Auto-segments sessions using your genuine prompts as boundaries, collapsing noise (`continue`, interrupts) so you can see cost per milestone.
-- **🎯 Two-Tier Reclaim Engine**:
-  - **Tier 1 (Provable)**: Unused MCP schemas, byte-identical duplicate file reads within the same session. Pre-ticked for reclaim.
-  - **Tier 2 (Inferred)**: Fat outputs (>8k tokens) and resident prefix items with transparent proxy criteria.
-- **✂️ Non-Destructive Prune & Fork**:
-  - **Tombstone**: Guts the body of selected tool results while preserving the 1:1 `tool_use`/`tool_result` invariant required by the Claude API.
-  - **Fork**: Generates a new session UUID in-place.
-  - **APFS Clone**: Fast copy-on-write clone (`cp -c -R`) of `~/.claude/file-history` (<100ms, 0 extra disk space).
-  - **Lineage Manifest**: Records all parent-child forks in `~/.claude/ctxtree/lineage.jsonl` with revert capability.
+### 📖 1. Context Surgeon & Narrative Stream
+- **Paragraph-by-Paragraph Timeline**: Chronological narrative organized by genuine prompt regions.
+- **Inline Rich Editor**: Edit, rewrite, or trim any paragraph with a live token counter.
+- **🛡️ Continuity Guard**: Analyzes future turns to detect downstream references (symbols, file paths, variables). Flags anchors as `🟢 Safe`, `🟡 Anchor`, or `🔴 Critical Anchor` so you never accidentally break dialogue flow.
+- **🌉 Smart Continuity Bridges**:
+  - *File Reads*: Preserves imports, exports, and structure (`[Context Bridge: Inspected server.go (defines TripHandler, StartServer)...]`).
+  - *Bash Outputs*: Preserves command intent and clean result summary.
+  - *Code Condenser*: Keeps head and tail (15 lines each) while cleanly omitting the middle.
+- **✨ Milestone Synthesizer**: Collapse multi-step trial-and-error detours into a cohesive milestone turn.
+
+### 🌳 2. WizTree Visualizer & Treemap
+- **⚡ 1-Second Scanner**: Scans your entire Claude Code history (`~/.claude/projects/`, 150MB+ across 60+ sessions) in **under 1.0 second**.
+- **Dual Accounting**:
+  - **Distinct Size**: Raw tokens of a paragraph.
+  - **Allocated**: `Size × turns resident` — reveals how an early command multiplies its token cost across every subsequent turn.
+- **Interactive Treemap**: Squarified treemap with authentic WizTree 3D bevels, instant hover tooltips, and click-to-jump into the paragraph editor.
+- **Actionable Lever Tree**: Breaks context down by `boot overhead`, `tool results`, `conversation`, and `subagent contexts`.
+
+### ✂️ 3. Safe Forking & Lineage
+- **1:1 Tool Pairing Preserved**: Guarantees compliance with Claude API constraints.
+- **APFS Clone**: Clones `~/.claude/file-history` in <100ms with zero extra disk space.
+- **Lineage Manifest**: Tracks all parent-child forks in `~/.claude/ctxtree/lineage.jsonl` with revert capability.
 
 ---
 
@@ -43,13 +51,16 @@ Long LLM coding sessions silently accumulate millions of tokens. A single large 
 Run directly via `npx` or Node.js (requires Node 18+ with zero external dependencies):
 
 ```bash
-# Start local server and automatically open WizTree interface
+# Start local server and launch Context Surgeon & WizTree UI
 npx ctxtree
 
-# Or run terminal summary report
+# Audit paragraphs, prompt regions, and continuity anchors for a session in terminal
+npx ctxtree --context [session-id]
+
+# Terminal overview of all sessions
 npx ctxtree --cli
 
-# Specify custom port
+# Custom port
 npx ctxtree --port 4000 --no-open
 ```
 
@@ -57,21 +68,15 @@ Then open `http://localhost:3888` in your browser.
 
 ---
 
-## CLI Options
+## Resuming a Cleaned Session
 
-```text
-ctxtree - WizTree for the LLM Context Window
+Once you edit or bridge paragraphs in the UI, click **"🚀 Fork Session Without Jumps"**. `ctxtree` forks the session and provides the exact resume command:
 
-Usage:
-  npx ctxtree [options]
-  node bin/ctxtree.js [options]
-
-Options:
-  -p, --port <port>    Port to listen on (default: 3888)
-  --no-open            Do not automatically open browser
-  --scan-only, --cli   Scan history, print terminal report and exit
-  -h, --help           Show this help message
+```bash
+claude --resume <fork-session-uuid>
 ```
+
+Your conversation continues seamlessly with all reasoning context intact, but with substantial context window headroom reclaimed.
 
 ---
 
@@ -80,8 +85,9 @@ Options:
 ```text
 ctxtree/
 ├── bin/
-│   └── ctxtree.js        # CLI launcher & terminal report
+│   └── ctxtree.js        # CLI launcher, terminal reports, and context auditor
 ├── src/
+│   ├── sessionEditor.js  # Paragraph context parser, continuity analyzer & bridge generator
 │   ├── paths.js          # Claude directory paths & slug resolvers
 │   ├── attach.js         # Attachment parser (MCP schemas, system prompt, skills)
 │   ├── tokens.js         # Multivariate calibration engine
@@ -93,22 +99,10 @@ ctxtree/
 │   ├── prune.js          # Tombstone rewriter, APFS cloner & lineage manifest
 │   └── server.js         # Zero-dependency HTTP server & REST API
 └── ui/
-    ├── index.html        # WizTree dark layout
-    ├── style.css         # Authentic WizTree styling & themes
-    └── app.js            # Canvas squarified treemap & UI state engine
+    ├── index.html        # Dual-mode Context Surgeon & WizTree layout
+    ├── style.css         # Authentic dark theme, narrative cards & continuity badges
+    └── app.js            # Canvas squarified treemap & paragraph editor state engine
 ```
-
----
-
-## Resuming a Pruned Session
-
-When you click **"Tombstone & Fork Session"** in the UI, `ctxtree` creates a new session JSONL file with the fat chunks removed and gives you the exact command to resume:
-
-```bash
-claude --resume <new-session-uuid>
-```
-
-Your conversation continues seamlessly with all reasoning context intact, but with significant context window headroom reclaimed.
 
 ---
 
