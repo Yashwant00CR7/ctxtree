@@ -15,6 +15,8 @@
     searchQuery: '',
     selectedRegionId: null,
     activeEditingBlock: null,
+    collapsedRegions: new Set(),
+    openInlineEditors: new Set(),
 
     // WizTree components
     currentTree: null,
@@ -107,6 +109,7 @@
   const surgeonRegionsList = document.getElementById('surgeon-regions-list');
   const narrativeStream = document.getElementById('narrative-stream');
   const surgeonSearchInput = document.getElementById('surgeon-search-input');
+  const btnToggleRegions = document.getElementById('btn-toggle-regions');
   const btnBatchBridge = document.getElementById('btn-batch-bridge');
   const btnResetEdits = document.getElementById('btn-reset-edits');
   const btnForkJumpfree = document.getElementById('btn-fork-jumpfree');
@@ -116,6 +119,7 @@
   const deltaOrigTok = document.getElementById('delta-orig-tok');
   const deltaNewTok = document.getElementById('delta-new-tok');
   const deltaSavedTok = document.getElementById('delta-saved-tok');
+  const deltaContinuityStatus = document.getElementById('delta-continuity-status');
 
   // Filter chips
   const filterChips = document.querySelectorAll('.filter-chip');
@@ -185,6 +189,20 @@
   const successCmdText = document.getElementById('success-cmd-text');
   const successTokSaved = document.getElementById('success-tok-saved');
   const btnCopyCmd = document.getElementById('btn-copy-cmd');
+
+  // Simulation & Auto-Heal Elements
+  const simModal = document.getElementById('sim-modal');
+  const simModalCloseBtn = document.getElementById('sim-modal-close-btn');
+  const simModalCloseBottom = document.getElementById('sim-modal-close-bottom');
+  const simBtnForkNow = document.getElementById('sim-btn-fork-now');
+  const simOrigTok = document.getElementById('sim-orig-tok');
+  const simNewTok = document.getElementById('sim-new-tok');
+  const simSavedTok = document.getElementById('sim-saved-tok');
+  const simPctSaved = document.getElementById('sim-pct-saved');
+  const simContinuityBadge = document.getElementById('sim-continuity-badge');
+  const simStream = document.getElementById('sim-stream');
+  const btnOpenSim = document.getElementById('btn-open-sim');
+  const btnAutoHealAll = document.getElementById('btn-auto-heal-all');
 
   // Mode switching
   function setViewMode(mode) {
@@ -276,6 +294,8 @@
     state.zoomStack = [];
     state.selectedNodeKey = null;
     state.stagedEdits.clear();
+    state.collapsedRegions.clear();
+    state.openInlineEditors.clear();
     await loadSessionView();
   });
 
@@ -295,13 +315,50 @@
     renderNarrativeStream();
   });
 
+  // Toggle Regions (Expand All / Collapse All)
+  if (btnToggleRegions) {
+    btnToggleRegions.addEventListener('click', () => {
+      if (!state.contextData || !state.contextData.regions) return;
+      if (state.collapsedRegions.size > 0) {
+        state.collapsedRegions.clear();
+        btnToggleRegions.textContent = '📁 Collapse All';
+      } else {
+        state.contextData.regions.forEach(r => state.collapsedRegions.add(r.id));
+        btnToggleRegions.textContent = '📁 Expand All';
+      }
+      renderNarrativeStream();
+    });
+  }
+
   // Batch Auto-Bridge Heavy
-  btnBatchBridge.addEventListener('click', () => {
+  btnBatchBridge.addEventListener('click', async () => {
     if (!state.contextData || !state.contextData.blocks) return;
     let count = 0;
-    state.contextData.blocks.forEach(b => {
+    for (const b of state.contextData.blocks) {
       if (b.tok >= 2000 && (b.kind === 'tool_result' || b.kind === 'tool_use')) {
-        const bridgeText = b.suggestedBridge || `[Context Bridge: Condensed ${b.chars} chars (${b.tool}) to maintain continuity]`;
+        let bridgeText = b.suggestedBridge;
+        if (b.tool === 'Read' && b.target) {
+          try {
+            const cRes = await fetch('/api/context/contract', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: b.text, filename: b.target })
+            }).then(r => r.json());
+            if (cRes.contract && cRes.contract.startsWith('[Interface Contract')) {
+              bridgeText = cRes.contract;
+            }
+          } catch {}
+        }
+        // Auto heal downstream anchors for guaranteed zero jumps
+        const downstream = b.continuity?.downstreamRefs || [];
+        if (downstream.length > 0) {
+          const textLower = bridgeText.toLowerCase();
+          const missing = downstream.filter(r => !textLower.includes(r.term.toLowerCase())).map(r => r.term);
+          if (missing.length > 0) {
+            bridgeText = bridgeText.trim() + `\n[Continuity Anchors: ${Array.from(new Set(missing)).slice(0, 10).join(', ')}]`;
+          }
+        }
+
         const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
         state.stagedEdits.set(b.id, {
           id: b.id,
@@ -318,7 +375,7 @@
         });
         count++;
       }
-    });
+    }
 
     renderNarrativeStream();
     updateDeltaTracker();
@@ -329,6 +386,7 @@
     if (state.stagedEdits.size === 0) return;
     if (confirm('Discard all staged paragraph edits?')) {
       state.stagedEdits.clear();
+      state.openInlineEditors.clear();
       renderNarrativeStream();
       updateDeltaTracker();
     }
@@ -390,8 +448,8 @@
         successTokSaved.textContent = `${fmt(data.savedTok)} tokens reclaimed (${fmt(data.savedAlloc)} shipped)`;
         successModal.classList.remove('hidden');
 
-        // Clear staged edits & reload forks
         state.stagedEdits.clear();
+        state.openInlineEditors.clear();
         state.forks = await fetch('/api/forks').then(r => r.json());
         renderForksTable();
       } else {
@@ -413,6 +471,26 @@
     btnCopyCmd.textContent = 'Copied!';
     setTimeout(() => { btnCopyCmd.textContent = 'Copy'; }, 1500);
   });
+
+  // Simulation & Auto-Heal Listeners
+  if (btnOpenSim) {
+    btnOpenSim.addEventListener('click', openSimulationModal);
+  }
+  if (btnAutoHealAll) {
+    btnAutoHealAll.addEventListener('click', autoHealAllEdits);
+  }
+  if (simModalCloseBtn) {
+    simModalCloseBtn.addEventListener('click', () => simModal.classList.add('hidden'));
+  }
+  if (simModalCloseBottom) {
+    simModalCloseBottom.addEventListener('click', () => simModal.classList.add('hidden'));
+  }
+  if (simBtnForkNow) {
+    simBtnForkNow.addEventListener('click', () => {
+      simModal.classList.add('hidden');
+      btnForkJumpfree.click();
+    });
+  }
 
   // Initial Load
   async function init() {
@@ -441,9 +519,7 @@
       updateTopStats();
       renderForksTable();
 
-      // If user came with a specific session (or default to top session)
       if (state.sid === 'all' && state.sessions.length > 0) {
-        // Default to first real session so Surgeon view is immediately active & rich!
         state.sid = state.sessions[0].sid;
         sessionSelect.value = state.sid;
       }
@@ -480,7 +556,7 @@
     forksCountBadge.textContent = state.forks.length;
 
     if (state.sid === 'all') {
-      windowTitleText.textContent = `[All Sessions] - ctxtree`;
+      windowTitleText.textContent = `[All Sessions] - ctxtree Context Surgeon`;
       statSelection.textContent = `<All Sessions (${state.sessions.length})>`;
       statAllocated.textContent = `${fmt(state.modelStats.alloc)} (Tokens × Turns)`;
       statSize.textContent = fmt(state.modelStats.tok);
@@ -492,7 +568,7 @@
     } else {
       const cur = state.sessions.find(s => s.sid === state.sid);
       if (cur) {
-        windowTitleText.textContent = `[${cur.sid.slice(0, 8)}] ${cur.projectName} - ctxtree`;
+        windowTitleText.textContent = `[${cur.sid.slice(0, 8)}] ${cur.projectName} - ctxtree Context Surgeon`;
         statSelection.textContent = `${cur.sid.slice(0, 8)} (${cur.projectName})`;
         statAllocated.textContent = `${fmt(cur.alloc)} (Tokens × Turns)`;
         statSize.textContent = fmt(cur.tok);
@@ -526,6 +602,15 @@
     if (state.sid !== 'all') {
       state.contextData = results[3];
       state.currentRegions = state.contextData.regions || [];
+
+      // Automatically collapse regions beyond the first 3 for fast initial view
+      state.collapsedRegions.clear();
+      if (state.currentRegions.length > 4) {
+        for (let i = 3; i < state.currentRegions.length; i++) {
+          state.collapsedRegions.add(state.currentRegions[i].id);
+        }
+        if (btnToggleRegions) btnToggleRegions.textContent = '📁 Expand All';
+      }
     } else {
       state.contextData = null;
       state.currentRegions = [];
@@ -533,7 +618,6 @@
 
     badgeReclaim.textContent = `${fmt(state.findings.provenTotal)} reclaimable`;
 
-    // Populate tables
     renderTreeTable();
     renderFindings();
     renderKindTable();
@@ -575,7 +659,13 @@
         document.querySelectorAll('.region-nav-item').forEach(el => el.classList.remove('active'));
         item.classList.add('active');
 
-        // Scroll narrative to this region header
+        // Expand region if collapsed
+        state.collapsedRegions.delete(r.id);
+        const wrapper = document.getElementById(`blocks-wrapper-${r.id}`);
+        const caret = document.getElementById(`caret-${r.id}`);
+        if (wrapper) wrapper.classList.remove('collapsed');
+        if (caret) caret.textContent = '▼';
+
         const targetHeader = document.getElementById(`narrative-region-${r.id}`);
         if (targetHeader) {
           targetHeader.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -592,7 +682,6 @@
 
     const blocks = state.contextData.blocks;
 
-    // Update filter chip counts
     chipCountAll.textContent = blocks.length;
     chipCountUser.textContent = blocks.filter(b => b.role === 'user' && b.kind === 'text').length;
     chipCountAssistant.textContent = blocks.filter(b => b.role === 'assistant').length;
@@ -601,7 +690,6 @@
     chipCountRisk.textContent = blocks.filter(b => b.continuity.riskLevel === 'high' || b.continuity.riskLevel === 'medium').length;
     chipCountEdited.textContent = state.stagedEdits.size;
 
-    // Filter blocks
     let filtered = blocks.filter(b => {
       if (state.filter === 'user') return b.role === 'user' && b.kind === 'text';
       if (state.filter === 'assistant') return b.role === 'assistant';
@@ -621,43 +709,82 @@
       );
     }
 
-    // Group filtered blocks by region
-    let lastRegionId = null;
-
+    // Group by region
+    const blocksByRegion = new Map();
     filtered.forEach(b => {
-      if (b.regionId !== lastRegionId) {
-        lastRegionId = b.regionId;
-        const regionObj = state.contextData.regions.find(r => r.id === b.regionId);
-        if (regionObj) {
-          const regionHdr = document.createElement('div');
-          regionHdr.className = 'region-narrative-header';
-          regionHdr.id = `narrative-region-${regionObj.id}`;
-          regionHdr.innerHTML = `
-            <div class="region-narrative-title">
-              <span>📍 Prompt Milestone: "${regionObj.prompt}"</span>
-            </div>
-            <div class="region-narrative-meta">
-              <button class="wiz-btn small btn-synth-region" data-region-id="${regionObj.id}">
-                ✨ Synthesize Milestone
-              </button>
-            </div>
-          `;
+      const rId = b.regionId || 0;
+      const list = blocksByRegion.get(rId) || [];
+      list.push(b);
+      blocksByRegion.set(rId, list);
+    });
 
-          regionHdr.querySelector('.btn-synth-region').addEventListener('click', () => {
-            synthesizeRegion(regionObj.id);
-          });
+    state.contextData.regions.forEach(regionObj => {
+      const regionBlocks = blocksByRegion.get(regionObj.id);
+      if (!regionBlocks || regionBlocks.length === 0) return;
 
-          narrativeStream.appendChild(regionHdr);
+      const isCollapsed = state.collapsedRegions.has(regionObj.id);
+
+      const regionHdr = document.createElement('div');
+      regionHdr.className = 'region-narrative-header';
+      regionHdr.id = `narrative-region-${regionObj.id}`;
+      regionHdr.innerHTML = `
+        <div class="region-narrative-title">
+          <span class="region-toggle-caret" id="caret-${regionObj.id}">${isCollapsed ? '▶' : '▼'}</span>
+          <span>📍 Milestone: "${regionObj.prompt}"</span>
+          <span style="font-size:11px;color:#888;font-weight:normal;">(${regionBlocks.length} items · ${fmt(regionObj.tok)} tok)</span>
+        </div>
+        <div class="region-narrative-meta" onclick="event.stopPropagation();">
+          <button class="wiz-btn small btn-synth-region" data-region-id="${regionObj.id}" title="Synthesize this entire milestone into a clean continuity bridge">
+            ✨ Synthesize Milestone
+          </button>
+        </div>
+      `;
+
+      regionHdr.addEventListener('click', () => {
+        const wrapper = document.getElementById(`blocks-wrapper-${regionObj.id}`);
+        const caret = document.getElementById(`caret-${regionObj.id}`);
+        if (state.collapsedRegions.has(regionObj.id)) {
+          state.collapsedRegions.delete(regionObj.id);
+          if (wrapper) wrapper.classList.remove('collapsed');
+          if (caret) caret.textContent = '▼';
+        } else {
+          state.collapsedRegions.add(regionObj.id);
+          if (wrapper) wrapper.classList.add('collapsed');
+          if (caret) caret.textContent = '▶';
         }
-      }
+      });
 
-      const card = createParagraphCard(b);
-      narrativeStream.appendChild(card);
+      regionHdr.querySelector('.btn-synth-region').addEventListener('click', () => {
+        synthesizeRegion(regionObj.id);
+      });
+
+      narrativeStream.appendChild(regionHdr);
+
+      // Wrapper for cards
+      const wrapper = document.createElement('div');
+      wrapper.className = `region-blocks-wrapper ${isCollapsed ? 'collapsed' : ''}`;
+      wrapper.id = `blocks-wrapper-${regionObj.id}`;
+
+      regionBlocks.forEach(b => {
+        const card = createParagraphCard(b);
+        wrapper.appendChild(card);
+      });
+
+      narrativeStream.appendChild(wrapper);
     });
 
     if (filtered.length === 0) {
       narrativeStream.innerHTML = `<div style="text-align:center;padding:40px;color:#888;">No paragraphs match the selected filter.</div>`;
     }
+  }
+
+  function updateSingleCard(blockId) {
+    const card = document.getElementById(`card-${blockId}`);
+    if (!card || !state.contextData || !state.contextData.blocks) return;
+    const block = state.contextData.blocks.find(b => b.id === blockId);
+    if (!block) return;
+    const newCard = createParagraphCard(block);
+    card.replaceWith(newCard);
   }
 
   function createParagraphCard(block) {
@@ -669,21 +796,22 @@
     if (isEdited) card.classList.add('is-edited');
 
     const editObj = state.stagedEdits.get(block.id);
+    const isInlineOpen = state.openInlineEditors.has(block.id);
 
-    // Continuity badge
     const risk = block.continuity.riskLevel || 'low';
     const riskLabel = risk === 'high' ? '🔴 Critical Anchor' : (risk === 'medium' ? '🟡 Anchor' : '🟢 Safe to trim');
     const riskTooltip = block.continuity.downstreamCount > 0
-      ? `Referenced in ${block.continuity.downstreamCount} subsequent turns (e.g. ${block.continuity.downstreamRefs.map(r => r.term).join(', ')})`
+      ? `Referenced in ${block.continuity.downstreamCount} subsequent turns: ${block.continuity.downstreamRefs.map(r => r.term).join(', ')}`
       : 'No downstream references detected';
 
-    // Role display
     let roleText = block.role;
     if (block.kind === 'tool_result') roleText = `Tool Result: ${block.tool || 'Output'}`;
     else if (block.kind === 'tool_use') roleText = `Tool Call: ${block.tool}`;
     else if (block.kind === 'thinking') roleText = 'Thinking';
     else if (block.role === 'user') roleText = 'User Prompt';
     else if (block.role === 'assistant') roleText = 'Assistant';
+
+    const isLongText = (block.text || '').length > 1200;
 
     card.innerHTML = `
       <div class="card-header">
@@ -698,15 +826,45 @@
           <span>${fmt(block.alloc)} alloc</span>
         </div>
         <div class="card-actions">
-          <button class="wiz-btn small btn-card-edit" title="Edit this paragraph">✏️ Edit</button>
+          <button class="wiz-btn small btn-card-edit" title="Edit this paragraph inline (or double-click text)">✏️ Edit</button>
           <button class="wiz-btn small btn-card-bridge" title="Insert seamless continuity bridge">🌉 Bridge</button>
+          <button class="wiz-btn small btn-card-contract" title="Extract interface contract / signatures">📑 Contract</button>
           <button class="wiz-btn small btn-card-condense" title="Keep head & tail, condense middle">🗜️</button>
           ${isEdited ? `<button class="wiz-btn small danger btn-card-revert" title="Revert to original">↩️</button>` : ''}
         </div>
       </div>
       <div class="card-body">
-        <div class="card-content-preview">${escapeHtml(block.text)}</div>
-        ${isEdited ? `
+        <div class="card-content-preview ${isLongText ? 'card-content-collapsed' : ''}" title="Double-click to edit this paragraph">${escapeHtml(block.text)}</div>
+        ${isLongText ? `<div class="card-content-toggle">▶ Show full content (${fmt(block.chars)} chars)</div>` : ''}
+
+        <!-- In-Card Inline Editor -->
+        ${isInlineOpen ? `
+          <div class="card-inline-editor" id="inline-editor-${block.id}">
+            <div class="inline-presets-row">
+              <span>Quick Presets:</span>
+              <button class="wiz-btn small btn-inline-bridge">🌉 Smart Bridge</button>
+              <button class="wiz-btn small btn-inline-contract">📑 Contract / Signatures</button>
+              <button class="wiz-btn small btn-inline-headtail">🗜️ Head & Tail</button>
+              <button class="wiz-btn small warn btn-inline-autoheal" title="Auto-append downstream anchor terms for 100% zero-jump continuity">⚡ Auto-Heal Anchors</button>
+            </div>
+            ${block.continuity.downstreamCount > 0 ? `
+              <div class="anchor-terms-row">
+                <span style="color:#ffb74d;">Downstream anchors:</span>
+                ${block.continuity.downstreamRefs.map(r => `<span class="anchor-term-pill" data-term="${r.term}" title="Click to insert into text">+ ${r.term} (turn ${r.turn})</span>`).join('')}
+              </div>
+            ` : ''}
+            <textarea class="inline-edit-textarea" rows="6" placeholder="Type edited paragraph context... (Cmd+Enter to save, Esc to cancel)">${escapeHtml(isEdited ? editObj.newText : block.text)}</textarea>
+            <div class="inline-editor-bottom">
+              <span class="inline-delta-preview">Original: ${fmt(block.tok)} tok ➔ Staged: <strong class="inline-new-tok">${fmt(isEdited ? editObj.tokAfter : block.tok)}</strong> tok</span>
+              <div class="inline-editor-btns">
+                <button class="wiz-btn small btn-inline-cancel">Cancel (Esc)</button>
+                <button class="wiz-btn small primary btn-inline-save">Save Edit (Cmd+Enter)</button>
+              </div>
+            </div>
+          </div>
+        ` : ''}
+
+        ${isEdited && !isInlineOpen ? `
           <div class="card-edited-state">
             <div class="card-edited-tag">
               <span>✓ STAGED FOR FORK (Zero Jumps)</span>
@@ -718,13 +876,157 @@
       </div>
     `;
 
+    // Long text preview toggle
+    if (isLongText) {
+      const toggleBtn = card.querySelector('.card-content-toggle');
+      const previewEl = card.querySelector('.card-content-preview');
+      if (toggleBtn && previewEl) {
+        toggleBtn.addEventListener('click', () => {
+          const isCollapsed = previewEl.classList.toggle('card-content-collapsed');
+          toggleBtn.textContent = isCollapsed
+            ? `▶ Show full content (${fmt(block.chars)} chars)`
+            : `▲ Collapse content`;
+        });
+      }
+    }
+
+    // Double-click to open inline editor
+    const previewEl = card.querySelector('.card-content-preview');
+    if (previewEl) {
+      previewEl.addEventListener('dblclick', () => {
+        state.openInlineEditors.add(block.id);
+        updateSingleCard(block.id);
+      });
+    }
+
     // Button actions
-    card.querySelector('.btn-card-edit').addEventListener('click', () => openEditModal(block));
+    card.querySelector('.btn-card-edit').addEventListener('click', () => {
+      if (state.openInlineEditors.has(block.id)) {
+        state.openInlineEditors.delete(block.id);
+      } else {
+        state.openInlineEditors.add(block.id);
+      }
+      updateSingleCard(block.id);
+    });
+
     card.querySelector('.btn-card-bridge').addEventListener('click', () => applyBridgeToBlock(block));
+    card.querySelector('.btn-card-contract').addEventListener('click', () => applyContractToBlock(block));
     card.querySelector('.btn-card-condense').addEventListener('click', () => applyCondenseToBlock(block));
+
     const revertBtn = card.querySelector('.btn-card-revert');
     if (revertBtn) {
       revertBtn.addEventListener('click', () => revertBlockEdit(block.id));
+    }
+
+    // In-Card Inline Editor handlers
+    if (isInlineOpen) {
+      const editorDiv = card.querySelector(`#inline-editor-${block.id}`);
+      const textarea = editorDiv.querySelector('.inline-edit-textarea');
+      const newTokEl = editorDiv.querySelector('.inline-new-tok');
+
+      setTimeout(() => {
+        textarea.focus();
+        textarea.selectionStart = textarea.value.length;
+        textarea.selectionEnd = textarea.value.length;
+      }, 10);
+
+      const updateTok = () => {
+        const newTok = Math.max(1, Math.round(textarea.value.length / 3.6));
+        newTokEl.textContent = fmt(newTok);
+      };
+
+      textarea.addEventListener('input', updateTok);
+
+      // Keyboard shortcuts: Cmd+Enter to save, Esc to cancel
+      textarea.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+          e.preventDefault();
+          saveCurrentInlineEdit();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          state.openInlineEditors.delete(block.id);
+          updateSingleCard(block.id);
+        }
+      });
+
+      editorDiv.querySelector('.btn-inline-bridge').addEventListener('click', () => {
+        textarea.value = block.suggestedBridge;
+        updateTok();
+      });
+
+      editorDiv.querySelector('.btn-inline-contract').addEventListener('click', async () => {
+        const cRes = await fetch('/api/context/contract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: block.text, filename: block.target })
+        }).then(r => r.json());
+        textarea.value = cRes.contract || block.suggestedBridge;
+        updateTok();
+      });
+
+      editorDiv.querySelector('.btn-inline-headtail').addEventListener('click', () => {
+        const lines = block.text.split('\n');
+        if (lines.length > 30) {
+          textarea.value = lines.slice(0, 15).join('\n') + `\n\n... [${lines.length - 30} lines condensed to eliminate context bloat] ...\n\n` + lines.slice(-15).join('\n');
+        } else {
+          textarea.value = block.text;
+        }
+        updateTok();
+      });
+
+      const autoHealBtn = editorDiv.querySelector('.btn-inline-autoheal');
+      if (autoHealBtn) {
+        autoHealBtn.addEventListener('click', async () => {
+          try {
+            const hRes = await fetch('/api/context/heal', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sid: state.sid, blockId: block.id, text: textarea.value })
+            }).then(r => r.json());
+            if (hRes.healedText) {
+              textarea.value = hRes.healedText;
+              updateTok();
+            }
+          } catch {}
+        });
+      }
+
+      // Anchor pills click to insert
+      editorDiv.querySelectorAll('.anchor-term-pill').forEach(pill => {
+        pill.addEventListener('click', () => {
+          const term = pill.dataset.term;
+          textarea.value += `\n[Preserved symbol: ${term}]`;
+          updateTok();
+        });
+      });
+
+      editorDiv.querySelector('.btn-inline-cancel').addEventListener('click', () => {
+        state.openInlineEditors.delete(block.id);
+        updateSingleCard(block.id);
+      });
+
+      const saveCurrentInlineEdit = () => {
+        const newText = textarea.value;
+        const newTok = Math.max(1, Math.round(newText.length / 3.6));
+        state.stagedEdits.set(block.id, {
+          id: block.id,
+          recordIndex: block.recordIndex,
+          contentIndex: block.contentIndex,
+          newText,
+          origText: block.originalText,
+          tokBefore: block.tok,
+          tokAfter: newTok,
+          allocBefore: block.alloc,
+          allocAfter: newTok * block.liveTurns,
+          isBridged: true,
+          note: 'Inline edited'
+        });
+        state.openInlineEditors.delete(block.id);
+        updateSingleCard(block.id);
+        updateDeltaTracker();
+      };
+
+      editorDiv.querySelector('.btn-inline-save').addEventListener('click', saveCurrentInlineEdit);
     }
 
     return card;
@@ -739,113 +1041,33 @@
       .replace(/"/g, '&quot;');
   }
 
-  // Edit Modal Workflow
-  function openEditModal(block) {
-    state.activeEditingBlock = block;
-    editModalTitle.textContent = `Edit Paragraph (Turn ${block.turn})`;
-    editMetaBadge.textContent = `${block.role}: ${block.tool || block.kind}`;
-    editMetaTarget.textContent = block.target || '';
-    editMetaTok.textContent = `Size: ${fmt(block.tok)} tokens (${block.chars.toLocaleString()} chars)`;
+  async function applyContractToBlock(block) {
+    const cRes = await fetch('/api/context/contract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: block.text, filename: block.target })
+    }).then(r => r.json());
 
-    // Continuity warning in modal
-    if (block.continuity.downstreamCount > 0) {
-      editContinuityWarning.classList.remove('hidden');
-      editContinuityTerms.innerHTML = '';
-      block.continuity.downstreamRefs.forEach(r => {
-        const pill = document.createElement('span');
-        pill.className = 'continuity-term-pill';
-        pill.textContent = `${r.term} (turn ${r.turn})`;
-        editContinuityTerms.appendChild(pill);
-      });
-    } else {
-      editContinuityWarning.classList.add('hidden');
-    }
+    let contractText = cRes.contract || block.suggestedBridge;
+    const newTok = Math.max(1, Math.round(contractText.length / 3.6));
 
-    const currentText = state.stagedEdits.has(block.id)
-      ? state.stagedEdits.get(block.id).newText
-      : block.text;
-
-    editParagraphTextarea.value = currentText;
-    updateModalTokPreview();
-
-    editParagraphModal.classList.remove('hidden');
-    editParagraphTextarea.focus();
-  }
-
-  function updateModalTokPreview() {
-    if (!state.activeEditingBlock) return;
-    const origTok = state.activeEditingBlock.tok;
-    const newText = editParagraphTextarea.value;
-    const newTok = Math.max(1, Math.round(newText.length / 3.6));
-    const saved = Math.max(0, origTok - newTok);
-
-    editTokOrig.textContent = fmt(origTok);
-    editTokNew.textContent = fmt(newTok);
-    editTokSaved.textContent = fmt(saved);
-  }
-
-  editParagraphTextarea.addEventListener('input', updateModalTokPreview);
-
-  // Modal Presets
-  btnPresetBridge.addEventListener('click', () => {
-    if (!state.activeEditingBlock) return;
-    editParagraphTextarea.value = state.activeEditingBlock.suggestedBridge;
-    updateModalTokPreview();
-  });
-
-  btnPresetHeadtail.addEventListener('click', () => {
-    if (!state.activeEditingBlock) return;
-    const lines = state.activeEditingBlock.text.split('\n');
-    if (lines.length > 30) {
-      const head = lines.slice(0, 15).join('\n');
-      const tail = lines.slice(-15).join('\n');
-      editParagraphTextarea.value = `${head}\n\n... [${lines.length - 30} lines condensed to eliminate context jumps] ...\n\n${tail}`;
-    } else {
-      editParagraphTextarea.value = state.activeEditingBlock.text;
-    }
-    updateModalTokPreview();
-  });
-
-  btnPresetTombstone.addEventListener('click', () => {
-    if (!state.activeEditingBlock) return;
-    const b = state.activeEditingBlock;
-    editParagraphTextarea.value = `[Context Note: ${b.tool || 'Output'} (${fmt(b.tok)} tokens) pruned for future turns; outcomes recorded in milestone]`;
-    updateModalTokPreview();
-  });
-
-  btnPresetOrig.addEventListener('click', () => {
-    if (!state.activeEditingBlock) return;
-    editParagraphTextarea.value = state.activeEditingBlock.originalText;
-    updateModalTokPreview();
-  });
-
-  editModalCloseBtn.addEventListener('click', () => editParagraphModal.classList.add('hidden'));
-  editModalCancelBtn.addEventListener('click', () => editParagraphModal.classList.add('hidden'));
-
-  editModalSaveBtn.addEventListener('click', () => {
-    if (!state.activeEditingBlock) return;
-    const b = state.activeEditingBlock;
-    const newText = editParagraphTextarea.value;
-    const newTok = Math.max(1, Math.round(newText.length / 3.6));
-
-    state.stagedEdits.set(b.id, {
-      id: b.id,
-      recordIndex: b.recordIndex,
-      contentIndex: b.contentIndex,
-      newText,
-      origText: b.originalText,
-      tokBefore: b.tok,
+    state.stagedEdits.set(block.id, {
+      id: block.id,
+      recordIndex: block.recordIndex,
+      contentIndex: block.contentIndex,
+      newText: contractText,
+      origText: block.originalText,
+      tokBefore: block.tok,
       tokAfter: newTok,
-      allocBefore: b.alloc,
-      allocAfter: newTok * b.liveTurns,
+      allocBefore: block.alloc,
+      allocAfter: newTok * block.liveTurns,
       isBridged: true,
-      note: 'Custom edited paragraph'
+      note: 'Extracted interface contract'
     });
 
-    editParagraphModal.classList.add('hidden');
-    renderNarrativeStream();
+    updateSingleCard(block.id);
     updateDeltaTracker();
-  });
+  }
 
   function applyBridgeToBlock(block) {
     const bridgeText = block.suggestedBridge || `[Context Bridge: Condensed ${block.chars} chars (${block.tool}) to maintain continuity]`;
@@ -864,7 +1086,7 @@
       note: 'Applied smart bridge'
     });
 
-    renderNarrativeStream();
+    updateSingleCard(block.id);
     updateDeltaTracker();
   }
 
@@ -874,7 +1096,7 @@
     if (lines.length > 30) {
       const head = lines.slice(0, 15).join('\n');
       const tail = lines.slice(-15).join('\n');
-      condensedText = `${head}\n\n... [${lines.length - 30} lines condensed to eliminate context jumps] ...\n\n${tail}`;
+      condensedText = `${head}\n\n... [${lines.length - 30} lines condensed to eliminate context bloat] ...\n\n${tail}`;
     } else {
       condensedText = block.suggestedBridge;
     }
@@ -894,55 +1116,138 @@
       note: 'Condensed head & tail'
     });
 
-    renderNarrativeStream();
+    updateSingleCard(block.id);
     updateDeltaTracker();
   }
 
   function revertBlockEdit(blockId) {
     state.stagedEdits.delete(blockId);
-    renderNarrativeStream();
+    state.openInlineEditors.delete(blockId);
+    updateSingleCard(blockId);
     updateDeltaTracker();
   }
 
-  function synthesizeRegion(regionId) {
-    if (!state.contextData || !state.contextData.blocks) return;
-    const regionBlocks = state.contextData.blocks.filter(b => b.regionId === regionId);
-    if (!regionBlocks.length) return;
+  async function synthesizeRegion(regionId) {
+    if (!state.sid || state.sid === 'all') return;
+    try {
+      const res = await fetch('/api/context/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sid: state.sid, regionId })
+      }).then(r => r.json());
 
-    let count = 0;
-    regionBlocks.forEach(b => {
-      // Don't wipe the primary user prompt
-      if (b.role === 'user' && b.kind === 'text') return;
+      if (res.ok && res.edits) {
+        for (const edit of res.edits) {
+          state.stagedEdits.set(edit.id, edit);
+          updateSingleCard(edit.id);
+        }
+        updateDeltaTracker();
+      }
+    } catch (err) {
+      console.error('Error synthesizing region:', err);
+    }
+  }
 
-      const bridgeText = b.suggestedBridge || `[Milestone Context: ${b.tool || 'Step'} outcome preserved]`;
-      const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
-      state.stagedEdits.set(b.id, {
-        id: b.id,
-        recordIndex: b.recordIndex,
-        contentIndex: b.contentIndex,
-        newText: bridgeText,
-        origText: b.originalText,
-        tokBefore: b.tok,
-        tokAfter: newTok,
-        allocBefore: b.alloc,
-        allocAfter: newTok * b.liveTurns,
-        isBridged: true,
-        note: 'Synthesized region milestone'
+  async function autoHealAllEdits() {
+    if (state.stagedEdits.size === 0) return;
+    try {
+      const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
+        id: e.id,
+        newText: e.newText
+      }));
+      const valRes = await fetch('/api/context/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sid: state.sid, edits: editsArray })
+      }).then(r => r.json());
+
+      if (valRes.warnings && valRes.warnings.length > 0) {
+        const missingByBlock = new Map();
+        for (const w of valRes.warnings) {
+          if (!missingByBlock.has(w.blockId)) missingByBlock.set(w.blockId, new Set());
+          missingByBlock.get(w.blockId).add(w.missingTerm);
+        }
+
+        for (const [blockId, termsSet] of missingByBlock.entries()) {
+          const edit = state.stagedEdits.get(blockId);
+          if (!edit) continue;
+          const blk = state.contextData.blocks.find(b => b.id === blockId);
+          const terms = Array.from(termsSet).slice(0, 10);
+          edit.newText = edit.newText.trim() + `\n[Continuity Anchors: ${terms.join(', ')}]`;
+          edit.tokAfter = Math.max(1, Math.round(edit.newText.length / 3.6));
+          if (blk) edit.allocAfter = edit.tokAfter * blk.liveTurns;
+          state.stagedEdits.set(blockId, edit);
+          updateSingleCard(blockId);
+        }
+        updateDeltaTracker();
+      }
+    } catch (err) {
+      console.error('Error auto-healing edits:', err);
+    }
+  }
+
+  async function openSimulationModal() {
+    if (!state.sid || state.sid === 'all') return;
+    try {
+      const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
+        id: e.id,
+        newText: e.newText,
+        tokBefore: e.tokBefore,
+        tokAfter: e.tokAfter
+      }));
+      const simRes = await fetch('/api/context/simulate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sid: state.sid, edits: editsArray })
+      }).then(r => r.json());
+
+      simOrigTok.textContent = fmt(simRes.totalOriginalTok);
+      simNewTok.textContent = fmt(simRes.totalSimulatedTok);
+      simSavedTok.textContent = `${fmt(simRes.savedTok)} tok`;
+      simPctSaved.textContent = `${simRes.pctSaved}%`;
+
+      if (simRes.continuity.isClean) {
+        simContinuityBadge.className = 'sim-badge ok';
+        simContinuityBadge.textContent = '🛡️ 100% Continuity Verified (Zero Jumps)';
+      } else {
+        simContinuityBadge.className = 'sim-badge warn';
+        simContinuityBadge.textContent = `⚠️ Continuity: ${simRes.continuity.healthScore}% (${simRes.continuity.warnings.length} anchors missing)`;
+      }
+
+      simStream.innerHTML = '';
+      simRes.turns.forEach(turn => {
+        const turnCard = document.createElement('div');
+        turnCard.className = `sim-turn-card ${turn.role || 'assistant'}`;
+        turnCard.innerHTML = `
+          <div class="sim-turn-header">
+            <span><strong>Turn ${turn.turn}</strong> · ${turn.role === 'user' ? '👤 User' : '🤖 Assistant'}</span>
+            <span>${fmt(turn.tok)} tok</span>
+          </div>
+          ${turn.messages.map(m => `
+            <div class="sim-msg-item ${m.isEdited ? 'edited' : ''}">
+              ${m.isEdited ? `<div class="sim-msg-tag">✓ BRIDGED CONTEXT (${m.tool || m.kind})</div>` : ''}
+              ${escapeHtml(m.text)}
+            </div>
+          `).join('')}
+        `;
+        simStream.appendChild(turnCard);
       });
-      count++;
-    });
 
-    renderNarrativeStream();
-    updateDeltaTracker();
+      simModal.classList.remove('hidden');
+    } catch (err) {
+      console.error(err);
+      alert('Failed to simulate resumed session');
+    }
   }
 
-  function updateDeltaTracker() {
+  async function updateDeltaTracker() {
     if (!state.contextData) {
       deltaOrigTok.textContent = '0 tok';
       deltaNewTok.textContent = '0 tok';
       deltaSavedTok.textContent = '0 tok (0%)';
       btnForkJumpfree.disabled = true;
       stagedCountLabel.textContent = '0';
+      deltaContinuityStatus.textContent = '100% Clean (Zero Jumps)';
       return;
     }
 
@@ -962,6 +1267,33 @@
 
     stagedCountLabel.textContent = state.stagedEdits.size;
     btnForkJumpfree.disabled = state.stagedEdits.size === 0;
+
+    // Validate Continuity with server
+    if (state.stagedEdits.size > 0) {
+      try {
+        const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
+          id: e.id,
+          newText: e.newText
+        }));
+        const valRes = await fetch('/api/context/validate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sid: state.sid, edits: editsArray })
+        }).then(r => r.json());
+
+        if (valRes.isClean) {
+          deltaContinuityStatus.textContent = `100% Verified (Zero Jumps)`;
+          deltaContinuityStatus.style.color = '#4ec9b0';
+        } else {
+          deltaContinuityStatus.textContent = `Continuity: ${valRes.healthScore}% (${valRes.warnings.length} anchor terms suggested)`;
+          deltaContinuityStatus.style.color = '#ff9800';
+          deltaContinuityStatus.title = valRes.warnings.map(w => w.message).join('\n');
+        }
+      } catch {}
+    } else {
+      deltaContinuityStatus.textContent = `100% Clean (Zero Jumps)`;
+      deltaContinuityStatus.style.color = '#4ec9b0';
+    }
   }
 
   // ==========================================
@@ -1561,7 +1893,7 @@
           <div class="tooltip-row"><span>Distinct Size:</span><span class="tooltip-val">${fmt(found.tok)} tokens</span></div>
           <div class="tooltip-row"><span>Allocated:</span><span class="tooltip-val">${fmt(found.alloc)} tokens</span></div>
           <div class="tooltip-row"><span>Residency:</span><span class="tooltip-val">${found.live || 1} turns</span></div>
-          <div class="tooltip-row"><span>Click:</span><span class="tooltip-val" style="color:#4caf50;">Jump to Context Editor ➔</span></div>
+          <div class="tooltip-row"><span>Action:</span><span class="tooltip-val" style="color:#4caf50;">Click to jump to Context Editor ➔</span></div>
         `;
       } else {
         treemapTooltip.classList.add('hidden');
@@ -1577,7 +1909,6 @@
     treemapCanvas.addEventListener('click', () => {
       if (state.hoveredRect) {
         const r = state.hoveredRect;
-        // In Dual or Surgeon mode, find matching paragraph in Narrative and scroll to it!
         if (state.contextData && state.contextData.blocks) {
           const matchBlock = state.contextData.blocks.find(b =>
             (b.tuid && b.tuid === r.tuid) ||
@@ -1586,6 +1917,12 @@
 
           if (matchBlock) {
             setViewMode('dual');
+            // Expand region if collapsed
+            if (matchBlock.regionId != null) {
+              state.collapsedRegions.delete(matchBlock.regionId);
+              renderNarrativeStream();
+            }
+
             setTimeout(() => {
               const card = document.getElementById(`card-${matchBlock.id}`);
               if (card) {

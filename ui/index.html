@@ -95,8 +95,14 @@
       </div>
 
       <div class="surgeon-actions">
-        <button class="wiz-btn small" id="btn-batch-bridge" title="Auto-bridge all heavy tool results (>3k tokens) into concise continuity summaries">
-          🌉 Auto-Bridge Heavy (>3k)
+        <button class="wiz-btn small" id="btn-toggle-regions" title="Expand or collapse all prompt regions">
+          📁 Expand All
+        </button>
+        <button class="wiz-btn small" id="btn-batch-bridge" title="Auto-bridge all heavy tool results (>2.5k tokens) into concise continuity summaries">
+          🌉 Auto-Bridge Heavy
+        </button>
+        <button class="wiz-btn small" id="btn-open-sim" title="Simulate what Claude Code will see when resumed">
+          👁️ Preview Resumed LLM
         </button>
         <button class="wiz-btn small" id="btn-reset-edits" title="Discard all staged paragraph edits">
           ↩️ Reset Edits
@@ -122,9 +128,10 @@
         <span class="delta-label">Saved:</span>
         <strong id="delta-saved-tok">0 tok (0%)</strong>
       </div>
-      <div class="delta-col continuity-ok">
+      <div class="delta-col continuity-ok" id="delta-continuity-col">
         <span>🛡️ Continuity Guarantee:</span>
         <strong id="delta-continuity-status">100% Clean (Zero Jumps)</strong>
+        <button class="wiz-btn small warn" id="btn-auto-heal-all" style="display:none;margin-left:8px;" title="Auto-inject missing anchor terms into all staged edits to achieve 100% zero-jump continuity">⚡ Auto-Heal All (Zero Jumps)</button>
       </div>
     </div>
 
@@ -404,6 +411,30 @@
         </div>
         <div class="modal-footer">
           <button class="wiz-btn primary" id="success-done-btn">Done</button>
+        </div>
+      </div>
+    <!-- Resumed Session Simulation Modal -->
+    <div id="sim-modal" class="modal-overlay hidden">
+      <div class="modal-dialog sim-dialog">
+        <div class="modal-header">
+          <h3>👁️ Resumed Session Simulation (What Claude Code Sees)</h3>
+          <button class="modal-close" id="sim-modal-close-btn">✕</button>
+        </div>
+        <div class="modal-body sim-modal-body">
+          <div class="sim-meta-bar">
+            <div>Original: <strong id="sim-orig-tok">0</strong> tok</div>
+            <div class="delta-arrow">➔</div>
+            <div>Simulated: <strong id="sim-new-tok">0</strong> tok</div>
+            <div style="color:#4caf50;">Saved: <strong id="sim-saved-tok">0</strong> (<span id="sim-pct-saved">0%</span>)</div>
+            <div id="sim-continuity-badge" class="sim-badge ok">🛡️ 100% Continuity Verified</div>
+          </div>
+          <div class="sim-stream" id="sim-stream">
+            <!-- Simulated conversation turns rendered here -->
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="wiz-btn" id="sim-modal-close-bottom">Close</button>
+          <button class="wiz-btn primary" id="sim-btn-fork-now">🚀 Fork This Clean Session</button>
         </div>
       </div>
     </div>

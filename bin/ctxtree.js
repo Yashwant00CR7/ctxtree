@@ -5,7 +5,7 @@ import os from 'node:os';
 import { CtxServer } from '../src/server.js';
 import { build } from '../src/model.js';
 import { findings } from '../src/findings.js';
-import { getSessionContext } from '../src/sessionEditor.js';
+import { getSessionContext, quickBridgeSession, simulateResumedSession } from '../src/sessionEditor.js';
 
 const args = process.argv.slice(2);
 
@@ -22,6 +22,9 @@ Options:
   --no-open            Do not automatically open browser
   --scan-only, --cli   Scan history, print terminal report and exit
   --context [sid]      Inspect paragraphs, prompt regions, and continuity anchors
+  --preview [sid]      Simulate and preview resumed conversational stream in terminal
+  --bridge [sid]       Auto-bridge heavy blocks, fork clean session, and output resume command
+  --threshold <n>      Token threshold for --bridge (default: 2500)
   -h, --help           Show this help message
 `);
   process.exit(0);
@@ -137,8 +140,100 @@ PROMPT REGIONS:`);
   console.log(`
 To edit these paragraphs interactively with real-time continuity checking:
   Run: npx ctxtree
-=============================================================\n`);
+=============================================================
+`);
   process.exit(0);
+}
+
+const prevIdx = args.findIndex(a => a === '--preview' || a === '--simulate');
+if (prevIdx !== -1) {
+  const model = build();
+  let targetSid = args[prevIdx + 1];
+  if (!targetSid || targetSid.startsWith('-')) {
+    targetSid = model.sessions[0]?.sid;
+  } else {
+    const found = model.sessions.find(s => s.sid.startsWith(targetSid));
+    if (found) targetSid = found.sid;
+  }
+
+  if (!targetSid) {
+    console.error('No matching session found.');
+    process.exit(1);
+  }
+
+  const sim = simulateResumedSession(targetSid, [], model);
+  console.log(`
+=============================================================
+  ctxtree - Resumed Session Dialogue Simulator [${targetSid.slice(0, 8)}]
+=============================================================
+  Total Turns         : ${sim.turnsCount}
+  Total Original Tok  : ${fmt(sim.totalOriginalTok)} tok
+  Total Simulated Tok : ${fmt(sim.totalSimulatedTok)} tok
+  Continuity Status   : ${sim.continuity.isClean ? '🛡️ 100% Verified (Zero Jumps)' : `⚠️ ${sim.continuity.healthScore}% (${sim.continuity.warnings.length} anchors missing)`}
+
+SAMPLE RESUMED TURNS:`);
+
+  sim.turns.slice(0, 5).forEach(t => {
+    console.log(`\n--- Turn ${t.turn} (${t.role === 'user' ? '👤 User' : '🤖 Assistant'} · ${fmt(t.tok)} tok) ---`);
+    t.messages.forEach(m => {
+      const tag = m.isEdited ? ' [BRIDGED]' : '';
+      console.log(`[${m.tool || m.kind}]${tag}: ${m.text.slice(0, 120).replace(/\n/g, ' ')}...`);
+    });
+  });
+
+  console.log(`\n=============================================================\n`);
+  process.exit(0);
+}
+
+const bridgeIdx = args.findIndex(a => a === '--bridge');
+if (bridgeIdx !== -1) {
+  const model = build();
+  let targetSid = args[bridgeIdx + 1];
+  if (!targetSid || targetSid.startsWith('-')) {
+    targetSid = model.sessions[0]?.sid;
+  } else {
+    const found = model.sessions.find(s => s.sid.startsWith(targetSid));
+    if (found) targetSid = found.sid;
+  }
+
+  if (!targetSid) {
+    console.error('No matching session found.');
+    process.exit(1);
+  }
+
+  let threshold = 2500;
+  const tIdx = args.findIndex(a => a === '--threshold');
+  if (tIdx !== -1 && args[tIdx + 1]) {
+    threshold = parseInt(args[tIdx + 1], 10) || 2500;
+  }
+
+  console.log(`⚡ Quick-bridging session ${targetSid.slice(0, 8)} (blocks >= ${threshold} tok)...`);
+  const t0 = Date.now();
+  try {
+    const res = await quickBridgeSession({ sid: targetSid, threshold, note: `CLI quick-bridged at threshold ${threshold}` }, model);
+    if (!res.ok) {
+      console.log(`Notice: ${res.message}`);
+      process.exit(0);
+    }
+    const dur = Date.now() - t0;
+    console.log(`
+=============================================================
+  ctxtree - Jump-Free Session Fork Created (${dur}ms)
+=============================================================
+  Fork Session ID : ${res.forkSid}
+  Parent Session  : ${res.parentSid.slice(0, 8)} (${res.projectName})
+  Paragraphs Bridged: ${res.editedBlocksCount}
+  Tokens Reclaimed: ${fmt(res.savedTok)} tok (${fmt(res.savedAlloc)} shipped)
+  Continuity Risk : ZERO JUMPS (Interfaces & anchors preserved)
+
+Resume Command (Run this to continue seamlessly):
+  ${res.resumeCmd}
+=============================================================\n`);
+    process.exit(0);
+  } catch (err) {
+    console.error('Error during quick bridge:', err);
+    process.exit(1);
+  }
 }
 
 const server = new CtxServer({ port });

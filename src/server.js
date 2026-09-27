@@ -7,7 +7,15 @@ import { buildTree, projectBreakdown } from './tree.js';
 import { buildRegions } from './regions.js';
 import { findings } from './findings.js';
 import { pruneSession, getLineage, revertFork } from './prune.js';
-import { getSessionContext, saveEditedSessionContext } from './sessionEditor.js';
+import {
+  getSessionContext,
+  saveEditedSessionContext,
+  extractContract,
+  validateContinuity,
+  autoHealBridgeText,
+  synthesizeRegionMilestone,
+  simulateResumedSession
+} from './sessionEditor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -307,6 +315,67 @@ export class CtxServer {
           const resData = await saveEditedSessionContext({ sid, edits, note }, model);
           setTimeout(() => this.ensureModel(true), 100);
           return sendJson(resData);
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
+      }
+
+      if (pathname === '/api/context/validate' && method === 'POST') {
+        const body = await readBody();
+        const { sid, edits } = body;
+        if (!sid || !edits) return sendJson({ error: 'sid and edits are required' }, 400);
+        try {
+          const ctxData = getSessionContext(sid, model);
+          const editMap = new Map();
+          edits.forEach(e => editMap.set(e.id, e));
+          const validation = validateContinuity(ctxData.blocks, editMap);
+          return sendJson(validation);
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
+      }
+
+      if (pathname === '/api/context/contract' && method === 'POST') {
+        const body = await readBody();
+        const { text, filename } = body;
+        const contract = extractContract(text || '', filename || '');
+        return sendJson({ contract });
+      }
+
+      if (pathname === '/api/context/synthesize' && method === 'POST') {
+        const body = await readBody();
+        const { sid, regionId } = body;
+        if (!sid || regionId == null) return sendJson({ error: 'sid and regionId are required' }, 400);
+        try {
+          const edits = synthesizeRegionMilestone(regionId, sid, model);
+          return sendJson({ ok: true, edits });
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
+      }
+
+      if (pathname === '/api/context/simulate' && method === 'POST') {
+        const body = await readBody();
+        const { sid, edits } = body;
+        if (!sid) return sendJson({ error: 'sid is required' }, 400);
+        try {
+          const sim = simulateResumedSession(sid, edits || [], model);
+          return sendJson(sim);
+        } catch (e) {
+          return sendJson({ error: e.message }, 500);
+        }
+      }
+
+      if (pathname === '/api/context/heal' && method === 'POST') {
+        const body = await readBody();
+        const { sid, blockId, text } = body;
+        if (!sid || !blockId || text == null) return sendJson({ error: 'sid, blockId, and text are required' }, 400);
+        try {
+          const ctxData = getSessionContext(sid, model);
+          const block = ctxData.blocks.find(b => b.id === blockId);
+          if (!block) return sendJson({ error: 'Block not found' }, 404);
+          const healedText = autoHealBridgeText(block, text);
+          return sendJson({ healedText });
         } catch (e) {
           return sendJson({ error: e.message }, 500);
         }
