@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
 import { CtxServer } from '../src/server.js';
 import { build } from '../src/model.js';
 import { findings } from '../src/findings.js';
 import { getSessionContext, quickBridgeSession, simulateResumedSession } from '../src/sessionEditor.js';
+import { listForks } from '../src/fork.js';
+import { bootView, structureView } from '../src/surgery.js';
 
 const args = process.argv.slice(2);
 
@@ -17,14 +20,21 @@ Usage:
   npx ctxtree [options]
   node bin/ctxtree.js [options]
 
+Commands:
+  resume <fork>        Resume a ctxtree fork (id or prefix) with its launch profile.
+                       Forks that removed boot overhead MUST be resumed this way:
+                       without the profile Claude Code re-announces what was removed.
+
 Options:
   -p, --port <port>    Port to listen on (default: 3888)
   --no-open            Do not automatically open browser
   --scan-only, --cli   Scan history, print terminal report and exit
   --context [sid]      Inspect paragraphs, prompt regions, and continuity anchors
   --preview [sid]      Simulate and preview resumed conversational stream in terminal
-  --bridge [sid]       Auto-bridge heavy blocks, fork clean session, and output resume command
+  --boot <sid>         What boot overhead the session resumes with, and what can be removed
+  --bridge <sid>       Bridge heavy live tool output into a fork (session id or prefix required)
   --threshold <n>      Token threshold for --bridge (default: 2500)
+  --dry-run            With --bridge: build and verify the fork, write nothing
   -h, --help           Show this help message
 `);
   process.exit(0);
@@ -34,6 +44,30 @@ if (args.includes('-h') || args.includes('--help')) {
   printHelp();
 }
 
+if (args[0] === 'resume') {
+  const want = args[1];
+  const forks = listForks().filter(f => want && f.forkSid.startsWith(want));
+  if (forks.length !== 1) {
+    console.error(!want ? 'Usage: ctxtree resume <fork id or prefix>' : forks.length ? `"${want}" matches ${forks.length} forks; use a longer prefix.` : `No ctxtree fork matches "${want}".`);
+    process.exit(2);
+  }
+  const f = forks[0];
+  const claudeArgs = ['--resume', f.forkSid];
+  if (f.profileFile) {
+    if (!fs.existsSync(f.profileFile)) { console.error(`This fork's launch profile is missing: ${f.profileFile}`); process.exit(1); }
+    claudeArgs.push('--settings', f.profileFile);
+  }
+  claudeArgs.push(...args.slice(2));
+  const cwd = f.cwd && fs.existsSync(f.cwd) ? f.cwd : process.cwd();
+  console.error(`ctxtree: claude ${claudeArgs.join(' ')}   (in ${cwd})`);
+  const child = spawn('claude', claudeArgs, { cwd, stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('error', (err) => { console.error(`Could not start claude: ${err.message}`); process.exit(1); });
+} else {
+  main();
+}
+
+async function main() {
 const scanOnly = args.includes('--scan-only') || args.includes('--cli');
 const noOpen = args.includes('--no-open');
 
@@ -115,8 +149,8 @@ if (ctxIdx !== -1) {
   ctxtree - Context Surgeon Audit: [${ctx.sid.slice(0, 8)}] ${ctx.projectName}
 =============================================================
   Total Turns      : ${ctx.totalTurns}
-  Total Paragraphs : ${ctx.totalBlocks}
-  Total Tokens     : ${fmt(ctx.totalTokens)} tok
+  Total Paragraphs : ${ctx.totalBlocks} (${ctx.liveBlocks} in resumed context, ${ctx.deadBlocks} outside it)
+  Resumed Context  : ~${fmt(ctx.totalTokens)} tok   (outside it: ~${fmt(ctx.deadTokens)} tok, not loaded on resume)
   Total Allocated  : ${fmt(ctx.totalAlloc)} (x turns resident)
   Prompt Milestones: ${ctx.regions.length}
 
@@ -126,7 +160,7 @@ PROMPT REGIONS:`);
     console.log(`  [Region ${i + 1}] "${r.prompt.slice(0, 60)}" (Turn ${r.turn} · ${fmt(r.tok)} tok · ${r.blocksCount} items)`);
   });
 
-  const heavyBlocks = ctx.blocks.filter(b => b.tok >= 2000).sort((a, b) => b.tok - a.tok);
+  const heavyBlocks = ctx.blocks.filter(b => b.live && b.tok >= 2000).sort((a, b) => b.tok - a.tok);
   console.log(`\nHEAVY PARAGRAPHS & CONTINUITY ANCHORS (${heavyBlocks.length} items >= 2k tok):`);
   heavyBlocks.slice(0, 6).forEach(b => {
     const risk = b.continuity.riskLevel === 'high' ? '🔴 HIGH RISK' : (b.continuity.riskLevel === 'medium' ? '🟡 ANCHOR' : '🟢 SAFE');
@@ -134,7 +168,7 @@ PROMPT REGIONS:`);
     if (b.continuity.downstreamCount > 0) {
       console.log(`    ↳ Downstream refs: ${b.continuity.downstreamRefs.map(r => r.term + ' (turn ' + r.turn + ')').join(', ')}`);
     }
-    console.log(`    ↳ Smart Bridge: ${b.suggestedBridge.slice(0, 80)}...`);
+    console.log(b.editable ? `    ↳ Smart Bridge: ${b.suggestedBridge.slice(0, 80)}...` : `    ↳ Locked: ${b.lock}`);
   });
 
   console.log(`
@@ -142,6 +176,29 @@ To edit these paragraphs interactively with real-time continuity checking:
   Run: npx ctxtree
 =============================================================
 `);
+  process.exit(0);
+}
+
+const bootIdx = args.findIndex(a => a === '--boot');
+if (bootIdx !== -1) {
+  const model = build();
+  const want = args[bootIdx + 1];
+  const matches = model.sessions.filter(s => want && !want.startsWith('-') && s.sid.startsWith(want));
+  if (matches.length !== 1) { console.error(matches.length ? `"${want}" matches ${matches.length} sessions.` : 'Usage: ctxtree --boot <session id or prefix>'); process.exit(2); }
+  const b = bootView(model, matches[0].sid);
+  const st = structureView(model, matches[0].sid);
+  console.log(`\n  Boot overhead resumed by ${matches[0].sid.slice(0, 8)} (${matches[0].projectName}): ~${fmt(b.total)} tokens\n`);
+  const bySub = new Map();
+  for (const it of b.items) { const l = bySub.get(it.sub) || []; l.push(it); bySub.set(it.sub, l); }
+  for (const [sub, list] of bySub) {
+    console.log(`  ${sub.padEnd(16)} ~${fmt(list.reduce((a, i) => a + i.tok, 0)).padStart(6)}`);
+    for (const it of list.slice(0, 8)) console.log(`      ${fmt(it.tok).padStart(6)}  ${it.name.slice(0, 70)}${it.removable ? '' : '   (not removable)'}`);
+    if (list.length > 8) console.log(`      ...and ${list.length - 8} more`);
+  }
+  console.log(`\n  Outside the resumed context: ~${fmt(st.dead.tok)} tokens (${st.dead.blocks} blocks) -- saves nothing if deleted.`);
+  if (st.compaction) console.log(`    before the last compaction: ~${fmt(st.compaction.compactedTok)} tokens${st.compaction.restorable ? ' (restorable: uncompact)' : ''}`);
+  if (st.branches.length) console.log(`    on ${st.branches.length} rewind branch(es) you left (switchable)`);
+  console.log(`\n  Remove any of it in the UI (npx ctxtree): right-click a node in the tree.\n`);
   process.exit(0);
 }
 
@@ -169,7 +226,7 @@ if (prevIdx !== -1) {
   Total Turns         : ${sim.turnsCount}
   Total Original Tok  : ${fmt(sim.totalOriginalTok)} tok
   Total Simulated Tok : ${fmt(sim.totalSimulatedTok)} tok
-  Continuity Status   : ${sim.continuity.isClean ? '🛡️ 100% Verified (Zero Jumps)' : `⚠️ ${sim.continuity.healthScore}% (${sim.continuity.warnings.length} anchors missing)`}
+  Anchor terms        : ${sim.continuity.isClean ? 'all preserved (keyword heuristic)' : `${sim.continuity.healthScore}% preserved (${sim.continuity.warnings.length} missing)`}
 
 SAMPLE RESUMED TURNS:`);
 
@@ -187,51 +244,50 @@ SAMPLE RESUMED TURNS:`);
 
 const bridgeIdx = args.findIndex(a => a === '--bridge');
 if (bridgeIdx !== -1) {
+  // Writing a fork is never a default: the session must be named explicitly.
+  const want = args[bridgeIdx + 1];
+  if (!want || want.startsWith('-')) {
+    console.error('--bridge needs a session id (or a unique prefix). List sessions with: ctxtree --cli');
+    process.exit(2);
+  }
   const model = build();
-  let targetSid = args[bridgeIdx + 1];
-  if (!targetSid || targetSid.startsWith('-')) {
-    targetSid = model.sessions[0]?.sid;
-  } else {
-    const found = model.sessions.find(s => s.sid.startsWith(targetSid));
-    if (found) targetSid = found.sid;
+  const matches = model.sessions.filter(s => s.sid.startsWith(want));
+  if (matches.length !== 1) {
+    console.error(matches.length ? `"${want}" matches ${matches.length} sessions; use a longer prefix.` : `No session matches "${want}".`);
+    process.exit(2);
   }
-
-  if (!targetSid) {
-    console.error('No matching session found.');
-    process.exit(1);
-  }
+  const targetSid = matches[0].sid;
 
   let threshold = 2500;
   const tIdx = args.findIndex(a => a === '--threshold');
-  if (tIdx !== -1 && args[tIdx + 1]) {
-    threshold = parseInt(args[tIdx + 1], 10) || 2500;
-  }
+  if (tIdx !== -1 && args[tIdx + 1]) threshold = parseInt(args[tIdx + 1], 10) || 2500;
+  const dryRun = args.includes('--dry-run');
 
-  console.log(`⚡ Quick-bridging session ${targetSid.slice(0, 8)} (blocks >= ${threshold} tok)...`);
+  console.log(`${dryRun ? 'Dry run: ' : ''}bridging live tool output >= ${threshold} tok in ${targetSid.slice(0, 8)}...`);
   const t0 = Date.now();
   try {
-    const res = await quickBridgeSession({ sid: targetSid, threshold, note: `CLI quick-bridged at threshold ${threshold}` }, model);
-    if (!res.ok) {
-      console.log(`Notice: ${res.message}`);
-      process.exit(0);
-    }
-    const dur = Date.now() - t0;
+    const res = await quickBridgeSession({ sid: targetSid, threshold, dryRun, note: `CLI bridge at threshold ${threshold}` }, model);
+    if (!res.ok) { console.log(res.message); process.exit(0); }
     console.log(`
 =============================================================
-  ctxtree - Jump-Free Session Fork Created (${dur}ms)
+  ctxtree - ${dryRun ? 'Fork verified (dry run, nothing written)' : 'Fork created'} (${Date.now() - t0}ms)
 =============================================================
-  Fork Session ID : ${res.forkSid}
-  Parent Session  : ${res.parentSid.slice(0, 8)} (${res.projectName})
-  Paragraphs Bridged: ${res.editedBlocksCount}
-  Tokens Reclaimed: ${fmt(res.savedTok)} tok (${fmt(res.savedAlloc)} shipped)
-  Continuity Risk : ZERO JUMPS (Interfaces & anchors preserved)
-
-Resume Command (Run this to continue seamlessly):
+  Parent session   : ${res.parentSid} (${res.projectName})
+  Fork session     : ${res.forkSid}${dryRun ? '  (not written)' : ''}
+  Blocks rewritten : ${res.edits}   records touched: ${res.modifiedRecords}
+  Resumed context  : ~${fmt(res.resume.before)} -> ~${fmt(res.resume.after)} tokens (${fmt(res.savedTok)} reclaimed)
+  Verified         : record count, uuid chain, resume leaf, tool pairing,
+                     session ids, and every unedited block unchanged
+  File history     : ${dryRun ? '-' : res.history}
+${dryRun ? '' : `
+Resume the fork with:
   ${res.resumeCmd}
-=============================================================\n`);
+`}=============================================================
+`);
     process.exit(0);
   } catch (err) {
-    console.error('Error during quick bridge:', err);
+    console.error(`Fork not created: ${err.message}`);
+    for (const p of err.problems || []) console.error(`  - ${p.error}`);
     process.exit(1);
   }
 }
@@ -264,3 +320,4 @@ process.on('SIGINT', () => {
   console.log('\nShutting down ctxtree...');
   server.stop().then(() => process.exit(0));
 });
+}

@@ -1,1952 +1,1328 @@
-// ctxtree - WizTree & Context Surgeon Client Application
-(function () {
+// ctxtree: WizTree for the context window.
+// One session at a time: a tree, a type list and a cushion treemap over the
+// exact context `claude --resume` sends. Mark what you no longer need, review,
+// and ctxtree writes a verified fork; the original session is never touched.
+(() => {
   'use strict';
 
-  // Application State
-  const state = {
-    sid: 'all',
-    viewMode: 'surgeon', // 'surgeon' | 'wiztree' | 'dual'
-    metric: 'alloc', // 'alloc' or 'tok'
-    modelStats: null,
-    sessions: [],
-    contextData: null, // full session context with paragraphs & regions
-    stagedEdits: new Map(), // blockId -> edit object
-    filter: 'all', // 'all' | 'user' | 'assistant' | 'tools' | 'heavy' | 'risk' | 'edited'
-    searchQuery: '',
-    selectedRegionId: null,
-    activeEditingBlock: null,
-    collapsedRegions: new Set(),
-    openInlineEditors: new Set(),
-
-    // WizTree components
-    currentTree: null,
-    currentChunks: [],
-    findings: { proven: [], inferred: [], provenTotal: 0, inferredTotal: 0 },
-    forks: [],
-    expandedNodes: new Set(['root']),
-    selectedNodeKey: null,
-    selectedTuids: new Set(),
-    treemapRects: [],
-    zoomStack: [],
-    hoveredRect: null,
+  // ------------------------------------------------------------ plumbing
+  const TOKEN = (document.querySelector('meta[name="ctxtree-token"]') || {}).content || '';
+  async function api(path, body) {
+    const init = { headers: { 'X-Ctxtree-Token': TOKEN } };
+    if (body !== undefined) {
+      init.method = 'POST';
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    const r = await fetch(path, init);
+    const isJson = (r.headers.get('content-type') || '').includes('json');
+    const data = isJson ? await r.json() : { error: await r.text() };
+    if (!r.ok) { const e = new Error(data.error || r.statusText); e.data = data; throw e; }
+    return data;
+  }
+  const $ = (s) => document.querySelector(s);
+  function h(tag, attrs, ...kids) {
+    const el = document.createElement(tag);
+    if (attrs) for (const [k, v] of Object.entries(attrs)) {
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k === 'style') el.style.cssText = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? '' : v);
+    }
+    for (const k of kids.flat()) if (k != null && k !== false) el.append(k.nodeType ? k : String(k));
+    return el;
+  }
+  const svg = (markup, cls = '') => {
+    const t = document.createElement('template');
+    t.innerHTML = `<svg class="${cls}" viewBox="0 0 16 16" aria-hidden="true">${markup}</svg>`;
+    return t.content.firstChild;
   };
-
-  // Color Palette mapping
-  const COLOR_PALETTE = {
-    'boot': '#6a1b9a',
-    'tool schemas': '#7b1fa2',
-    'system prompt': '#4a148c',
-    'skills': '#311b92',
-    'agent listing': '#283593',
-    'tools': '#e65100',
-    'Read': '#f57c00',
-    'Bash': '#ff9800',
-    'Write': '#d81b60',
-    'Edit': '#c2185b',
-    'Glob': '#ef6c00',
-    'Grep': '#fb8c00',
-    'conversation': '#2e7d32',
-    'user': '#43a047',
-    'assistant': '#1565c0',
-    'thinking': '#8e24aa',
-    'image': '#5d4037',
-    'injected': '#00695c',
-    'subcontext': '#00838f',
-    'default': '#455a64'
+  const ICON = {
+    chev: '<path d="M5 3l5 5-5 5"/>',
+    lock: '<rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>',
+    check: '<path d="M3.5 8.5l3 3 6-7"/>',
   };
-
-  function getColor(item) {
-    if (!item) return COLOR_PALETTE.default;
-    const key = item.sub || item.tool || item.cat || item.kind;
-    if (COLOR_PALETTE[key]) return COLOR_PALETTE[key];
-    if (item.cat && COLOR_PALETTE[item.cat]) return COLOR_PALETTE[item.cat];
-    let h = 0;
-    const str = String(key);
-    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) & 0xffffff;
-    return `hsl(${Math.abs(h) % 360}, 65%, 45%)`;
+  const fmt = (n) => {
+    n = Math.round(n || 0);
+    const a = Math.abs(n);
+    if (a >= 1e6) return `${(n / 1e6).toFixed(a >= 1e7 ? 1 : 2).replace(/\.?0+$/, '')}M`;
+    if (a >= 1e3) return `${(n / 1e3).toFixed(a >= 1e5 ? 0 : 1).replace(/\.0$/, '')}k`;
+    return String(n);
+  };
+  const pct = (a, b) => (b > 0 ? `${((100 * a) / b).toFixed(a / b >= 0.995 ? 0 : 1)}%` : '');
+  const ago = (ts) => {
+    const s = (Date.now() - new Date(ts).getTime()) / 1000;
+    if (!isFinite(s)) return '';
+    if (s < 60) return 'just now';
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+    if (s < 86400 * 30) return `${Math.round(s / 86400)}d ago`;
+    return new Date(ts).toLocaleDateString();
+  };
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(`ctxtree.${k}`); return v == null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(`ctxtree.${k}`, JSON.stringify(v)); } catch { /* private mode */ } },
+  };
+  let toastT = 0;
+  function toast(msg, bad = false) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.className = `toast${bad ? ' bad' : ''}`;
+    clearTimeout(toastT);
+    toastT = setTimeout(() => t.classList.add('hidden'), bad ? 6000 : 2600);
   }
 
-  function fmt(n) {
-    if (n == null || isNaN(n)) return '0';
-    if (n >= 1e9) return (n / 1e9).toFixed(2) + ' B';
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + ' M';
-    if (n >= 1e3) return (n / 1e3).toFixed(0) + ' k';
-    return String(Math.round(n));
+  // ------------------------------------------------------------- colours
+  // Fixed hues for the setup and conversation families; tool results take
+  // vivid colours in order of size, like WizTree does for extensions.
+  const FIXED = {
+    sys: '#7b879c', tools: '#5a8cf0', mcp: '#8f6ef2', skill: '#c56fdc', agent: '#4bb4dc', md: '#38bfa3',
+    prompt: '#e2b04c', reply: '#d98a5a', call: '#a98a62', image: '#e47b9c', attach: '#69717f', task: '#55606f',
+  };
+  const VIVID = ['#f0664d', '#4cb86e', '#3fa4f2', '#e9c440', '#ee5fa7', '#9fcd3e', '#ff9b45', '#2cc6d8', '#b07cf7', '#f3807a', '#6fd3a8', '#d6a35a'];
+  const LABEL = {
+    sys: 'System prompt', tools: 'Built-in tools', mcp: 'MCP servers', skill: 'Skills', agent: 'Agents',
+    md: 'CLAUDE.md & memory', prompt: 'Your messages', reply: 'Claude’s replies', call: 'Tool calls',
+    image: 'Images', attach: 'Attachments',
+  };
+  const prettyTool = (n) => (n.startsWith('mcp__') ? n.slice(5).split('__').join(' › ') : n);
+  const typeLabel = (t) => LABEL[t] || (t.startsWith('r:') ? `${prettyTool(t.slice(2))} results` : t);
+  const colors = new Map();
+  const colorOf = (t) => colors.get(t) || FIXED[t] || '#59606b';
+  const rgbCache = new Map();
+  function rgb(hex) {
+    let v = rgbCache.get(hex);
+    if (!v) { const n = parseInt(hex.slice(1), 16); v = [(n >> 16) & 255, (n >> 8) & 255, n & 255]; rgbCache.set(hex, v); }
+    return v;
   }
 
-  function fmtPct(p) {
-    if (p == null || isNaN(p)) return '0.0%';
-    return (p * 100).toFixed(1) + '%';
+  // --------------------------------------------------------------- state
+  const S = {
+    sessions: [], sid: null, map: null, roots: [],
+    byId: new Map(), parent: new Map(),
+    open: new Set(), sel: null, marks: new Set(),
+    ops: { uncompact: false, slim: false, switchTip: '' },
+    undo: [], typeHi: null,
+    view: store.get('view', 'tasks'),
+    sorts: { tasks: store.get('sort.tasks', { key: 'turn', dir: 1 }), types: store.get('sort.types', { key: 'tok', dir: -1 }) },
+    rows: [], forks: [], actByKey: new Map(),
+  };
+  Object.defineProperty(S, 'sort', { get: () => S.sorts[S.view], set: (v) => { S.sorts[S.view] = v; store.set(`sort.${S.view}`, v); } });
+  const curRoot = () => S.roots[0];
+  const isGrey = (n) => { while (n) { if (n.id === 'grey') return true; n = S.parent.get(n.id); } return false; };
+  const rootOf = (n) => { while (S.parent.get(n.id)) n = S.parent.get(n.id); return n; };
+  const ancestors = (n) => { const a = []; let p = S.parent.get(n.id); while (p) { a.push(p); p = S.parent.get(p.id); } return a; };
+  // A leaf carries one or more actions (a task item is a call and its result).
+  // Marks are kept per action, so both views share them.
+  const akey = (a) => (a.k === 'boot' ? `boot:${a.id}` : a.id);
+  const actsOf = (n) => n.acts || [];
+  const canDelete = (n) => actsOf(n).length > 0;
+  const isMarked = (n) => canDelete(n) && actsOf(n).every(a => S.marks.has(akey(a)));
+  const saveOf = (n) => actsOf(n).reduce((t, a) => t + (a.save || 0), 0);
+  const markedSave = (n) => actsOf(n).reduce((t, a) => t + (S.marks.has(akey(a)) ? a.save || 0 : 0), 0);
+  const isShrink = (n) => actsOf(n).length === 1 && actsOf(n)[0].op === 'shrink';
+  const isTask = (n) => n.t === 'task';
+  const isToolOutput = (n) => !n.kids && (n.t.startsWith('r:') || n.t === 'call');
+
+  function index() {
+    S.byId.clear(); S.parent.clear();
+    const walk = (n, p) => {
+      S.byId.set(n.id, n);
+      if (p) S.parent.set(n.id, p);
+      for (const k of n.kids || []) walk(k, n);
+    };
+    for (const r of S.roots) walk(r, null);
+    // colours: result types by size
+    colors.clear();
+    const res = new Map();
+    const each = (n) => { if (n.kids) n.kids.forEach(each); else if (n.t.startsWith('r:')) res.set(n.t, (res.get(n.t) || 0) + n.tok); };
+    S.roots.forEach(each);
+    [...res.entries()].sort((a, b) => b[1] - a[1]).forEach(([t], i) => colors.set(t, VIVID[i % VIVID.length]));
   }
 
-  // DOM Elements
-  const sessionSelect = document.getElementById('session-select');
-  const btnScan = document.getElementById('btn-scan');
-  const scanStatus = document.getElementById('scan-status');
-  const windowTitleText = document.getElementById('window-title-text');
-  const mainWorkspace = document.getElementById('main-workspace');
-
-  // Top Stats
-  const statSelection = document.getElementById('stat-selection');
-  const statAllocated = document.getElementById('stat-allocated');
-  const statSize = document.getElementById('stat-size');
-  const statCompacts = document.getElementById('stat-compacts');
-  const meterPercent = document.getElementById('meter-percent');
-  const meterBarFill = document.getElementById('meter-bar-fill');
-  const badgeReclaim = document.getElementById('badge-reclaim');
-
-  // Mode buttons
-  const modeSurgeonBtn = document.getElementById('mode-surgeon-btn');
-  const modeWizTreeBtn = document.getElementById('mode-wiztree-btn');
-  const modeDualBtn = document.getElementById('mode-dual-btn');
-
-  // Views
-  const surgeonView = document.getElementById('surgeon-view');
-  const wiztreeView = document.getElementById('wiztree-view');
-  const surgeonToolbar = document.getElementById('surgeon-toolbar');
-
-  // Surgeon Elements
-  const surgeonRegionsList = document.getElementById('surgeon-regions-list');
-  const narrativeStream = document.getElementById('narrative-stream');
-  const surgeonSearchInput = document.getElementById('surgeon-search-input');
-  const btnToggleRegions = document.getElementById('btn-toggle-regions');
-  const btnBatchBridge = document.getElementById('btn-batch-bridge');
-  const btnResetEdits = document.getElementById('btn-reset-edits');
-  const btnForkJumpfree = document.getElementById('btn-fork-jumpfree');
-  const stagedCountLabel = document.getElementById('staged-count-label');
-
-  // Delta tracker
-  const deltaOrigTok = document.getElementById('delta-orig-tok');
-  const deltaNewTok = document.getElementById('delta-new-tok');
-  const deltaSavedTok = document.getElementById('delta-saved-tok');
-  const deltaContinuityStatus = document.getElementById('delta-continuity-status');
-
-  // Filter chips
-  const filterChips = document.querySelectorAll('.filter-chip');
-  const chipCountAll = document.getElementById('chip-count-all');
-  const chipCountUser = document.getElementById('chip-count-user');
-  const chipCountAssistant = document.getElementById('chip-count-assistant');
-  const chipCountTools = document.getElementById('chip-count-tools');
-  const chipCountHeavy = document.getElementById('chip-count-heavy');
-  const chipCountRisk = document.getElementById('chip-count-risk');
-  const chipCountEdited = document.getElementById('chip-count-edited');
-
-  // WizTree Elements
-  const treeTbody = document.getElementById('tree-tbody');
-  const regionsTbody = document.getElementById('regions-tbody');
-  const forksTbody = document.getElementById('forks-tbody');
-  const kindTbody = document.getElementById('kind-tbody');
-  const projectsTbody = document.getElementById('projects-tbody');
-  const findingsContainer = document.getElementById('findings-container');
-  const findingsCountBadge = document.getElementById('findings-count-badge');
-  const forksCountBadge = document.getElementById('forks-count-badge');
-  const reclaimSelectedSavings = document.getElementById('reclaim-selected-savings');
-  const btnPruneSelected = document.getElementById('btn-prune-selected');
-
-  // Treemap Elements
-  const treemapCanvas = document.getElementById('treemap-canvas');
-  const treemapContainer = document.getElementById('treemap-container');
-  const treemapTooltip = document.getElementById('treemap-tooltip');
-  const treemapBreadcrumb = document.getElementById('treemap-breadcrumb');
-  const btnZoomReset = document.getElementById('btn-zoom-reset');
-  const metricAllocBtn = document.getElementById('metric-alloc');
-  const metricSizeBtn = document.getElementById('metric-size');
-
-  // Edit Paragraph Modal
-  const editParagraphModal = document.getElementById('edit-paragraph-modal');
-  const editModalTitle = document.getElementById('edit-modal-title');
-  const editModalCloseBtn = document.getElementById('edit-modal-close-btn');
-  const editModalCancelBtn = document.getElementById('edit-modal-cancel-btn');
-  const editModalSaveBtn = document.getElementById('edit-modal-save-btn');
-  const editMetaBadge = document.getElementById('edit-meta-badge');
-  const editMetaTarget = document.getElementById('edit-meta-target');
-  const editMetaTok = document.getElementById('edit-meta-tok');
-  const editContinuityWarning = document.getElementById('edit-continuity-warning');
-  const editContinuityTerms = document.getElementById('edit-continuity-terms');
-  const editParagraphTextarea = document.getElementById('edit-paragraph-textarea');
-  const editTokOrig = document.getElementById('edit-tok-orig');
-  const editTokNew = document.getElementById('edit-tok-new');
-  const editTokSaved = document.getElementById('edit-tok-saved');
-  const btnPresetBridge = document.getElementById('btn-preset-bridge');
-  const btnPresetHeadtail = document.getElementById('btn-preset-headtail');
-  const btnPresetTombstone = document.getElementById('btn-preset-tombstone');
-  const btnPresetOrig = document.getElementById('btn-preset-orig');
-
-  // Fork Modal
-  const forkModal = document.getElementById('fork-modal');
-  const forkModalCloseBtn = document.getElementById('fork-modal-close-btn');
-  const forkModalCancelBtn = document.getElementById('fork-modal-cancel-btn');
-  const forkModalConfirmBtn = document.getElementById('fork-modal-confirm-btn');
-  const forkModalCount = document.getElementById('fork-modal-count');
-  const forkModalTokSaved = document.getElementById('fork-modal-tok-saved');
-  const forkModalPctSaved = document.getElementById('fork-modal-pct-saved');
-  const forkNote = document.getElementById('fork-note');
-
-  // Success Modal
-  const successModal = document.getElementById('success-modal');
-  const successCloseBtn = document.getElementById('success-close-btn');
-  const successDoneBtn = document.getElementById('success-done-btn');
-  const successCmdText = document.getElementById('success-cmd-text');
-  const successTokSaved = document.getElementById('success-tok-saved');
-  const btnCopyCmd = document.getElementById('btn-copy-cmd');
-
-  // Simulation & Auto-Heal Elements
-  const simModal = document.getElementById('sim-modal');
-  const simModalCloseBtn = document.getElementById('sim-modal-close-btn');
-  const simModalCloseBottom = document.getElementById('sim-modal-close-bottom');
-  const simBtnForkNow = document.getElementById('sim-btn-fork-now');
-  const simOrigTok = document.getElementById('sim-orig-tok');
-  const simNewTok = document.getElementById('sim-new-tok');
-  const simSavedTok = document.getElementById('sim-saved-tok');
-  const simPctSaved = document.getElementById('sim-pct-saved');
-  const simContinuityBadge = document.getElementById('sim-continuity-badge');
-  const simStream = document.getElementById('sim-stream');
-  const btnOpenSim = document.getElementById('btn-open-sim');
-  const btnAutoHealAll = document.getElementById('btn-auto-heal-all');
-
-  // Mode switching
-  function setViewMode(mode) {
-    state.viewMode = mode;
-    modeSurgeonBtn.classList.toggle('active', mode === 'surgeon');
-    modeWizTreeBtn.classList.toggle('active', mode === 'wiztree');
-    modeDualBtn.classList.toggle('active', mode === 'dual');
-
-    mainWorkspace.classList.toggle('dual-mode', mode === 'dual');
-
-    if (mode === 'surgeon') {
-      surgeonView.classList.add('active');
-      wiztreeView.classList.remove('active');
-      surgeonToolbar.style.display = 'flex';
-    } else if (mode === 'wiztree') {
-      surgeonView.classList.remove('active');
-      wiztreeView.classList.add('active');
-      surgeonToolbar.style.display = 'none';
-      renderTreemap();
-    } else if (mode === 'dual') {
-      surgeonView.classList.add('active');
-      wiztreeView.classList.add('active');
-      surgeonToolbar.style.display = 'flex';
-      renderTreemap();
-    }
-  }
-
-  modeSurgeonBtn.addEventListener('click', () => setViewMode('surgeon'));
-  modeWizTreeBtn.addEventListener('click', () => setViewMode('wiztree'));
-  modeDualBtn.addEventListener('click', () => setViewMode('dual'));
-
-  // Tab switching in WizTree upper panel
-  document.querySelectorAll('.panel-tabs').forEach(tabGroup => {
-    tabGroup.addEventListener('click', e => {
-      const btn = e.target.closest('.tab-btn');
-      if (!btn) return;
-      const targetId = btn.dataset.tab;
-      const parentPanel = btn.closest('.panel');
-      parentPanel.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      parentPanel.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      btn.classList.add('active');
-      const targetContent = parentPanel.querySelector(`#${targetId}`);
-      if (targetContent) targetContent.classList.add('active');
-    });
-  });
-
-  // Metric Toggles
-  metricAllocBtn.addEventListener('click', () => {
-    if (state.metric === 'alloc') return;
-    state.metric = 'alloc';
-    metricAllocBtn.classList.add('active');
-    metricSizeBtn.classList.remove('active');
-    renderTreemap();
-  });
-  metricSizeBtn.addEventListener('click', () => {
-    if (state.metric === 'tok') return;
-    state.metric = 'tok';
-    metricSizeBtn.classList.add('active');
-    metricAllocBtn.classList.remove('active');
-    renderTreemap();
-  });
-
-  // Reset Zoom in Treemap
-  btnZoomReset.addEventListener('click', () => {
-    state.zoomStack = [];
-    renderBreadcrumb();
-    renderTreemap();
-  });
-
-  // Re-scan Button
-  btnScan.addEventListener('click', async () => {
-    btnScan.disabled = true;
-    scanStatus.textContent = 'Scanning sessions...';
-    try {
-      await fetch('/api/refresh', { method: 'POST' });
-      await loadAllData();
-      scanStatus.textContent = `Scan complete in ${(state.modelStats.scanMs / 1000).toFixed(2)} seconds`;
-    } catch (err) {
-      console.error(err);
-      scanStatus.textContent = 'Scan failed';
-    } finally {
-      btnScan.disabled = false;
-    }
-  });
-
-  // Session Dropdown Change
-  sessionSelect.addEventListener('change', async () => {
-    state.sid = sessionSelect.value;
-    state.zoomStack = [];
-    state.selectedNodeKey = null;
-    state.stagedEdits.clear();
-    state.collapsedRegions.clear();
-    state.openInlineEditors.clear();
-    await loadSessionView();
-  });
-
-  // Filter chips in Surgeon
-  filterChips.forEach(chip => {
-    chip.addEventListener('click', () => {
-      filterChips.forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      state.filter = chip.dataset.filter;
-      renderNarrativeStream();
-    });
-  });
-
-  // Search input in Surgeon
-  surgeonSearchInput.addEventListener('input', e => {
-    state.searchQuery = e.target.value.toLowerCase().trim();
-    renderNarrativeStream();
-  });
-
-  // Toggle Regions (Expand All / Collapse All)
-  if (btnToggleRegions) {
-    btnToggleRegions.addEventListener('click', () => {
-      if (!state.contextData || !state.contextData.regions) return;
-      if (state.collapsedRegions.size > 0) {
-        state.collapsedRegions.clear();
-        btnToggleRegions.textContent = '📁 Collapse All';
-      } else {
-        state.contextData.regions.forEach(r => state.collapsedRegions.add(r.id));
-        btnToggleRegions.textContent = '📁 Expand All';
-      }
-      renderNarrativeStream();
-    });
-  }
-
-  // Batch Auto-Bridge Heavy
-  btnBatchBridge.addEventListener('click', async () => {
-    if (!state.contextData || !state.contextData.blocks) return;
-    let count = 0;
-    for (const b of state.contextData.blocks) {
-      if (b.tok >= 2000 && (b.kind === 'tool_result' || b.kind === 'tool_use')) {
-        let bridgeText = b.suggestedBridge;
-        if (b.tool === 'Read' && b.target) {
-          try {
-            const cRes = await fetch('/api/context/contract', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: b.text, filename: b.target })
-            }).then(r => r.json());
-            if (cRes.contract && cRes.contract.startsWith('[Interface Contract')) {
-              bridgeText = cRes.contract;
-            }
-          } catch {}
-        }
-        // Auto heal downstream anchors for guaranteed zero jumps
-        const downstream = b.continuity?.downstreamRefs || [];
-        if (downstream.length > 0) {
-          const textLower = bridgeText.toLowerCase();
-          const missing = downstream.filter(r => !textLower.includes(r.term.toLowerCase())).map(r => r.term);
-          if (missing.length > 0) {
-            bridgeText = bridgeText.trim() + `\n[Continuity Anchors: ${Array.from(new Set(missing)).slice(0, 10).join(', ')}]`;
-          }
-        }
-
-        const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
-        state.stagedEdits.set(b.id, {
-          id: b.id,
-          recordIndex: b.recordIndex,
-          contentIndex: b.contentIndex,
-          newText: bridgeText,
-          origText: b.originalText,
-          tokBefore: b.tok,
-          tokAfter: newTok,
-          allocBefore: b.alloc,
-          allocAfter: newTok * b.liveTurns,
-          isBridged: true,
-          note: 'Auto-bridged heavy block'
-        });
-        count++;
-      }
-    }
-
-    renderNarrativeStream();
-    updateDeltaTracker();
-  });
-
-  // Reset All Edits
-  btnResetEdits.addEventListener('click', () => {
-    if (state.stagedEdits.size === 0) return;
-    if (confirm('Discard all staged paragraph edits?')) {
-      state.stagedEdits.clear();
-      state.openInlineEditors.clear();
-      renderNarrativeStream();
-      updateDeltaTracker();
-    }
-  });
-
-  // Open Fork Modal
-  btnForkJumpfree.addEventListener('click', () => {
-    if (state.stagedEdits.size === 0 || state.sid === 'all') return;
-    forkModalCount.textContent = state.stagedEdits.size;
-
-    let savedTok = 0;
-    for (const edit of state.stagedEdits.values()) {
-      savedTok += (edit.tokBefore - edit.tokAfter);
-    }
-    const origTotal = state.contextData.totalTokens || 1;
-    const pct = ((savedTok / origTotal) * 100).toFixed(1);
-
-    forkModalTokSaved.textContent = fmt(savedTok);
-    forkModalPctSaved.textContent = `${pct}% reclaimed`;
-    forkModal.classList.remove('hidden');
-  });
-
-  forkModalCloseBtn.addEventListener('click', () => forkModal.classList.add('hidden'));
-  forkModalCancelBtn.addEventListener('click', () => forkModal.classList.add('hidden'));
-
-  forkModalConfirmBtn.addEventListener('click', async () => {
-    forkModalConfirmBtn.disabled = true;
-    forkModalConfirmBtn.textContent = 'Forking without jumps...';
-
-    const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
-      id: e.id,
-      recordIndex: e.recordIndex,
-      contentIndex: e.contentIndex,
-      newText: e.newText,
-      tokBefore: e.tokBefore,
-      tokAfter: e.tokAfter,
-      allocBefore: e.allocBefore,
-      allocAfter: e.allocAfter,
-    }));
-
-    try {
-      const res = await fetch('/api/context/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sid: state.sid,
-          edits: editsArray,
-          note: forkNote.value || `Pruned ${editsArray.length} paragraphs without jumps`
-        })
-      });
-      const data = await res.json();
-
-      forkModal.classList.add('hidden');
-      forkModalConfirmBtn.disabled = false;
-      forkModalConfirmBtn.textContent = 'Confirm & Fork';
-
-      if (data.ok) {
-        successCmdText.textContent = data.resumeCmd;
-        successTokSaved.textContent = `${fmt(data.savedTok)} tokens reclaimed (${fmt(data.savedAlloc)} shipped)`;
-        successModal.classList.remove('hidden');
-
-        state.stagedEdits.clear();
-        state.openInlineEditors.clear();
-        state.forks = await fetch('/api/forks').then(r => r.json());
-        renderForksTable();
-      } else {
-        alert(`Error: ${data.error || 'Failed to save fork'}`);
-      }
-    } catch (err) {
-      console.error(err);
-      alert('Error saving forked session');
-      forkModalConfirmBtn.disabled = false;
-      forkModalConfirmBtn.textContent = 'Confirm & Fork';
-    }
-  });
-
-  successCloseBtn.addEventListener('click', () => successModal.classList.add('hidden'));
-  successDoneBtn.addEventListener('click', () => successModal.classList.add('hidden'));
-
-  btnCopyCmd.addEventListener('click', () => {
-    navigator.clipboard.writeText(successCmdText.textContent);
-    btnCopyCmd.textContent = 'Copied!';
-    setTimeout(() => { btnCopyCmd.textContent = 'Copy'; }, 1500);
-  });
-
-  // Simulation & Auto-Heal Listeners
-  if (btnOpenSim) {
-    btnOpenSim.addEventListener('click', openSimulationModal);
-  }
-  if (btnAutoHealAll) {
-    btnAutoHealAll.addEventListener('click', autoHealAllEdits);
-  }
-  if (simModalCloseBtn) {
-    simModalCloseBtn.addEventListener('click', () => simModal.classList.add('hidden'));
-  }
-  if (simModalCloseBottom) {
-    simModalCloseBottom.addEventListener('click', () => simModal.classList.add('hidden'));
-  }
-  if (simBtnForkNow) {
-    simBtnForkNow.addEventListener('click', () => {
-      simModal.classList.add('hidden');
-      btnForkJumpfree.click();
-    });
-  }
-
-  // Initial Load
-  async function init() {
-    setupCanvas();
-    await loadAllData();
-    window.addEventListener('resize', () => {
-      resizeCanvas();
-      renderTreemap();
-    });
-  }
-
-  async function loadAllData() {
-    const t0 = performance.now();
-    try {
-      const [statsRes, sessRes, forksRes] = await Promise.all([
-        fetch('/api/stats').then(r => r.json()),
-        fetch('/api/sessions').then(r => r.json()),
-        fetch('/api/forks').then(r => r.json())
-      ]);
-
-      state.modelStats = statsRes.stats;
-      state.sessions = sessRes;
-      state.forks = forksRes;
-
-      populateSessionSelect();
-      updateTopStats();
-      renderForksTable();
-
-      if (state.sid === 'all' && state.sessions.length > 0) {
-        state.sid = state.sessions[0].sid;
-        sessionSelect.value = state.sid;
-      }
-
-      await loadSessionView();
-
-      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-      scanStatus.textContent = `Scan complete in ${elapsed} seconds`;
-    } catch (e) {
-      console.error('Error loading data:', e);
-      scanStatus.textContent = 'Error loading data';
-    }
-  }
-
-  function populateSessionSelect() {
-    sessionSelect.innerHTML = '';
-    const allOpt = document.createElement('option');
-    allOpt.value = 'all';
-    allOpt.textContent = `<All Sessions / Overview> (${state.sessions.length} sessions · ${fmt(state.modelStats.alloc)} alloc)`;
-    sessionSelect.appendChild(allOpt);
-
-    state.sessions.forEach(s => {
-      const opt = document.createElement('option');
-      opt.value = s.sid;
-      const sidShort = s.sid.slice(0, 8);
-      opt.textContent = `${sidShort} | ${s.projectName} (${fmt(s.alloc)} alloc · ${s.turns} turns)`;
-      sessionSelect.appendChild(opt);
-    });
-
-    sessionSelect.value = state.sid;
-  }
-
-  function updateTopStats() {
-    forksCountBadge.textContent = state.forks.length;
-
-    if (state.sid === 'all') {
-      windowTitleText.textContent = `[All Sessions] - ctxtree Context Surgeon`;
-      statSelection.textContent = `<All Sessions (${state.sessions.length})>`;
-      statAllocated.textContent = `${fmt(state.modelStats.alloc)} (Tokens × Turns)`;
-      statSize.textContent = fmt(state.modelStats.tok);
-      statCompacts.textContent = `${state.modelStats.compacts} ceiling hits`;
-
-      const usedRatio = Math.min(1, state.modelStats.tok / (state.modelStats.peakMax || 200000));
-      meterPercent.textContent = fmtPct(usedRatio);
-      meterBarFill.style.width = fmtPct(usedRatio);
-    } else {
-      const cur = state.sessions.find(s => s.sid === state.sid);
-      if (cur) {
-        windowTitleText.textContent = `[${cur.sid.slice(0, 8)}] ${cur.projectName} - ctxtree Context Surgeon`;
-        statSelection.textContent = `${cur.sid.slice(0, 8)} (${cur.projectName})`;
-        statAllocated.textContent = `${fmt(cur.alloc)} (Tokens × Turns)`;
-        statSize.textContent = fmt(cur.tok);
-        statCompacts.textContent = `${cur.compacts} ceiling hits · ${cur.turns} turns`;
-
-        const usedRatio = Math.min(1, cur.tok / 200000);
-        meterPercent.textContent = `${fmt(cur.tok)} / 200k (${fmtPct(usedRatio)})`;
-        meterBarFill.style.width = fmtPct(usedRatio);
-      }
-    }
-  }
-
-  async function loadSessionView() {
-    updateTopStats();
-
-    const promises = [
-      fetch(`/api/tree?sid=${state.sid}`).then(r => r.json()),
-      fetch(`/api/findings?sid=${state.sid}`).then(r => r.json()),
-      fetch(`/api/chunks?sid=${state.sid}`).then(r => r.json())
-    ];
-
-    if (state.sid !== 'all') {
-      promises.push(fetch(`/api/context?sid=${state.sid}`).then(r => r.json()));
-    }
-
-    const results = await Promise.all(promises);
-    state.currentTree = results[0];
-    state.findings = results[1];
-    state.currentChunks = results[2];
-
-    if (state.sid !== 'all') {
-      state.contextData = results[3];
-      state.currentRegions = state.contextData.regions || [];
-
-      // Automatically collapse regions beyond the first 3 for fast initial view
-      state.collapsedRegions.clear();
-      if (state.currentRegions.length > 4) {
-        for (let i = 3; i < state.currentRegions.length; i++) {
-          state.collapsedRegions.add(state.currentRegions[i].id);
-        }
-        if (btnToggleRegions) btnToggleRegions.textContent = '📁 Expand All';
-      }
-    } else {
-      state.contextData = null;
-      state.currentRegions = [];
-    }
-
-    badgeReclaim.textContent = `${fmt(state.findings.provenTotal)} reclaimable`;
-
-    renderTreeTable();
-    renderFindings();
-    renderKindTable();
-    renderProjectsTable();
-    renderBreadcrumb();
-    renderTreemap();
-
-    if (state.contextData) {
-      renderRegionsSidebar();
-      renderNarrativeStream();
-      updateDeltaTracker();
-    } else {
-      surgeonRegionsList.innerHTML = `<div style="padding:15px;color:#888;">Select a specific session to inspect and edit paragraphs</div>`;
-      narrativeStream.innerHTML = `<div style="text-align:center;padding:40px;color:#888;">Please select a specific session from the dropdown above to use the Context Surgeon</div>`;
-    }
-  }
-
-  // ==========================================
-  // CONTEXT SURGEON RENDERING & LOGIC
-  // ==========================================
-
-  function renderRegionsSidebar() {
-    surgeonRegionsList.innerHTML = '';
-    if (!state.contextData || !state.contextData.regions) return;
-
-    state.contextData.regions.forEach(r => {
-      const item = document.createElement('div');
-      item.className = `region-nav-item ${state.selectedRegionId === r.id ? 'active' : ''}`;
-      item.innerHTML = `
-        <div class="region-nav-prompt">💬 ${r.prompt}</div>
-        <div class="region-nav-meta">
-          <span>Turn ${r.turn} · ${r.blocksCount} items</span>
-          <span>${fmt(r.tok)} tok</span>
-        </div>
-      `;
-
-      item.addEventListener('click', () => {
-        state.selectedRegionId = r.id;
-        document.querySelectorAll('.region-nav-item').forEach(el => el.classList.remove('active'));
-        item.classList.add('active');
-
-        // Expand region if collapsed
-        state.collapsedRegions.delete(r.id);
-        const wrapper = document.getElementById(`blocks-wrapper-${r.id}`);
-        const caret = document.getElementById(`caret-${r.id}`);
-        if (wrapper) wrapper.classList.remove('collapsed');
-        if (caret) caret.textContent = '▼';
-
-        const targetHeader = document.getElementById(`narrative-region-${r.id}`);
-        if (targetHeader) {
-          targetHeader.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
-
-      surgeonRegionsList.appendChild(item);
-    });
-  }
-
-  function renderNarrativeStream() {
-    narrativeStream.innerHTML = '';
-    if (!state.contextData || !state.contextData.blocks) return;
-
-    const blocks = state.contextData.blocks;
-
-    chipCountAll.textContent = blocks.length;
-    chipCountUser.textContent = blocks.filter(b => b.role === 'user' && b.kind === 'text').length;
-    chipCountAssistant.textContent = blocks.filter(b => b.role === 'assistant').length;
-    chipCountTools.textContent = blocks.filter(b => b.kind === 'tool_result' || b.kind === 'tool_use').length;
-    chipCountHeavy.textContent = blocks.filter(b => b.tok >= 2000).length;
-    chipCountRisk.textContent = blocks.filter(b => b.continuity.riskLevel === 'high' || b.continuity.riskLevel === 'medium').length;
-    chipCountEdited.textContent = state.stagedEdits.size;
-
-    let filtered = blocks.filter(b => {
-      if (state.filter === 'user') return b.role === 'user' && b.kind === 'text';
-      if (state.filter === 'assistant') return b.role === 'assistant';
-      if (state.filter === 'tools') return b.kind === 'tool_result' || b.kind === 'tool_use';
-      if (state.filter === 'heavy') return b.tok >= 2000;
-      if (state.filter === 'risk') return b.continuity.riskLevel === 'high' || b.continuity.riskLevel === 'medium';
-      if (state.filter === 'edited') return state.stagedEdits.has(b.id);
-      return true;
-    });
-
-    if (state.searchQuery) {
-      const q = state.searchQuery;
-      filtered = filtered.filter(b =>
-        b.text.toLowerCase().includes(q) ||
-        (b.target && b.target.toLowerCase().includes(q)) ||
-        (b.tool && b.tool.toLowerCase().includes(q))
-      );
-    }
-
-    // Group by region
-    const blocksByRegion = new Map();
-    filtered.forEach(b => {
-      const rId = b.regionId || 0;
-      const list = blocksByRegion.get(rId) || [];
-      list.push(b);
-      blocksByRegion.set(rId, list);
-    });
-
-    state.contextData.regions.forEach(regionObj => {
-      const regionBlocks = blocksByRegion.get(regionObj.id);
-      if (!regionBlocks || regionBlocks.length === 0) return;
-
-      const isCollapsed = state.collapsedRegions.has(regionObj.id);
-
-      const regionHdr = document.createElement('div');
-      regionHdr.className = 'region-narrative-header';
-      regionHdr.id = `narrative-region-${regionObj.id}`;
-      regionHdr.innerHTML = `
-        <div class="region-narrative-title">
-          <span class="region-toggle-caret" id="caret-${regionObj.id}">${isCollapsed ? '▶' : '▼'}</span>
-          <span>📍 Milestone: "${regionObj.prompt}"</span>
-          <span style="font-size:11px;color:#888;font-weight:normal;">(${regionBlocks.length} items · ${fmt(regionObj.tok)} tok)</span>
-        </div>
-        <div class="region-narrative-meta" onclick="event.stopPropagation();">
-          <button class="wiz-btn small btn-synth-region" data-region-id="${regionObj.id}" title="Synthesize this entire milestone into a clean continuity bridge">
-            ✨ Synthesize Milestone
-          </button>
-        </div>
-      `;
-
-      regionHdr.addEventListener('click', () => {
-        const wrapper = document.getElementById(`blocks-wrapper-${regionObj.id}`);
-        const caret = document.getElementById(`caret-${regionObj.id}`);
-        if (state.collapsedRegions.has(regionObj.id)) {
-          state.collapsedRegions.delete(regionObj.id);
-          if (wrapper) wrapper.classList.remove('collapsed');
-          if (caret) caret.textContent = '▼';
-        } else {
-          state.collapsedRegions.add(regionObj.id);
-          if (wrapper) wrapper.classList.add('collapsed');
-          if (caret) caret.textContent = '▶';
-        }
-      });
-
-      regionHdr.querySelector('.btn-synth-region').addEventListener('click', () => {
-        synthesizeRegion(regionObj.id);
-      });
-
-      narrativeStream.appendChild(regionHdr);
-
-      // Wrapper for cards
-      const wrapper = document.createElement('div');
-      wrapper.className = `region-blocks-wrapper ${isCollapsed ? 'collapsed' : ''}`;
-      wrapper.id = `blocks-wrapper-${regionObj.id}`;
-
-      regionBlocks.forEach(b => {
-        const card = createParagraphCard(b);
-        wrapper.appendChild(card);
-      });
-
-      narrativeStream.appendChild(wrapper);
-    });
-
-    if (filtered.length === 0) {
-      narrativeStream.innerHTML = `<div style="text-align:center;padding:40px;color:#888;">No paragraphs match the selected filter.</div>`;
-    }
-  }
-
-  function updateSingleCard(blockId) {
-    const card = document.getElementById(`card-${blockId}`);
-    if (!card || !state.contextData || !state.contextData.blocks) return;
-    const block = state.contextData.blocks.find(b => b.id === blockId);
-    if (!block) return;
-    const newCard = createParagraphCard(block);
-    card.replaceWith(newCard);
-  }
-
-  function createParagraphCard(block) {
-    const card = document.createElement('div');
-    card.className = 'paragraph-card';
-    card.id = `card-${block.id}`;
-
-    const isEdited = state.stagedEdits.has(block.id);
-    if (isEdited) card.classList.add('is-edited');
-
-    const editObj = state.stagedEdits.get(block.id);
-    const isInlineOpen = state.openInlineEditors.has(block.id);
-
-    const risk = block.continuity.riskLevel || 'low';
-    const riskLabel = risk === 'high' ? '🔴 Critical Anchor' : (risk === 'medium' ? '🟡 Anchor' : '🟢 Safe to trim');
-    const riskTooltip = block.continuity.downstreamCount > 0
-      ? `Referenced in ${block.continuity.downstreamCount} subsequent turns: ${block.continuity.downstreamRefs.map(r => r.term).join(', ')}`
-      : 'No downstream references detected';
-
-    let roleText = block.role;
-    if (block.kind === 'tool_result') roleText = `Tool Result: ${block.tool || 'Output'}`;
-    else if (block.kind === 'tool_use') roleText = `Tool Call: ${block.tool}`;
-    else if (block.kind === 'thinking') roleText = 'Thinking';
-    else if (block.role === 'user') roleText = 'User Prompt';
-    else if (block.role === 'assistant') roleText = 'Assistant';
-
-    const isLongText = (block.text || '').length > 1200;
-
-    card.innerHTML = `
-      <div class="card-header">
-        <div class="card-badges">
-          <span class="role-badge ${block.kind}">${roleText}</span>
-          ${block.target ? `<span class="target-label" title="${block.target}">${block.target}</span>` : ''}
-          <span class="continuity-badge ${risk}" title="${riskTooltip}">${riskLabel}</span>
-        </div>
-        <div class="card-metrics">
-          <span>Turn ${block.turn}</span> ·
-          <strong>${fmt(block.tok)} tok</strong> ·
-          <span>${fmt(block.alloc)} alloc</span>
-        </div>
-        <div class="card-actions">
-          <button class="wiz-btn small btn-card-edit" title="Edit this paragraph inline (or double-click text)">✏️ Edit</button>
-          <button class="wiz-btn small btn-card-bridge" title="Insert seamless continuity bridge">🌉 Bridge</button>
-          <button class="wiz-btn small btn-card-contract" title="Extract interface contract / signatures">📑 Contract</button>
-          <button class="wiz-btn small btn-card-condense" title="Keep head & tail, condense middle">🗜️</button>
-          ${isEdited ? `<button class="wiz-btn small danger btn-card-revert" title="Revert to original">↩️</button>` : ''}
-        </div>
-      </div>
-      <div class="card-body">
-        <div class="card-content-preview ${isLongText ? 'card-content-collapsed' : ''}" title="Double-click to edit this paragraph">${escapeHtml(block.text)}</div>
-        ${isLongText ? `<div class="card-content-toggle">▶ Show full content (${fmt(block.chars)} chars)</div>` : ''}
-
-        <!-- In-Card Inline Editor -->
-        ${isInlineOpen ? `
-          <div class="card-inline-editor" id="inline-editor-${block.id}">
-            <div class="inline-presets-row">
-              <span>Quick Presets:</span>
-              <button class="wiz-btn small btn-inline-bridge">🌉 Smart Bridge</button>
-              <button class="wiz-btn small btn-inline-contract">📑 Contract / Signatures</button>
-              <button class="wiz-btn small btn-inline-headtail">🗜️ Head & Tail</button>
-              <button class="wiz-btn small warn btn-inline-autoheal" title="Auto-append downstream anchor terms for 100% zero-jump continuity">⚡ Auto-Heal Anchors</button>
-            </div>
-            ${block.continuity.downstreamCount > 0 ? `
-              <div class="anchor-terms-row">
-                <span style="color:#ffb74d;">Downstream anchors:</span>
-                ${block.continuity.downstreamRefs.map(r => `<span class="anchor-term-pill" data-term="${r.term}" title="Click to insert into text">+ ${r.term} (turn ${r.turn})</span>`).join('')}
-              </div>
-            ` : ''}
-            <textarea class="inline-edit-textarea" rows="6" placeholder="Type edited paragraph context... (Cmd+Enter to save, Esc to cancel)">${escapeHtml(isEdited ? editObj.newText : block.text)}</textarea>
-            <div class="inline-editor-bottom">
-              <span class="inline-delta-preview">Original: ${fmt(block.tok)} tok ➔ Staged: <strong class="inline-new-tok">${fmt(isEdited ? editObj.tokAfter : block.tok)}</strong> tok</span>
-              <div class="inline-editor-btns">
-                <button class="wiz-btn small btn-inline-cancel">Cancel (Esc)</button>
-                <button class="wiz-btn small primary btn-inline-save">Save Edit (Cmd+Enter)</button>
-              </div>
-            </div>
-          </div>
-        ` : ''}
-
-        ${isEdited && !isInlineOpen ? `
-          <div class="card-edited-state">
-            <div class="card-edited-tag">
-              <span>✓ STAGED FOR FORK (Zero Jumps)</span>
-              <span>Tokens: ${fmt(editObj.tokBefore)} ➔ ${fmt(editObj.tokAfter)} (${fmt(editObj.tokBefore - editObj.tokAfter)} saved)</span>
-            </div>
-            <div class="card-edited-text">${escapeHtml(editObj.newText)}</div>
-          </div>
-        ` : ''}
-      </div>
-    `;
-
-    // Long text preview toggle
-    if (isLongText) {
-      const toggleBtn = card.querySelector('.card-content-toggle');
-      const previewEl = card.querySelector('.card-content-preview');
-      if (toggleBtn && previewEl) {
-        toggleBtn.addEventListener('click', () => {
-          const isCollapsed = previewEl.classList.toggle('card-content-collapsed');
-          toggleBtn.textContent = isCollapsed
-            ? `▶ Show full content (${fmt(block.chars)} chars)`
-            : `▲ Collapse content`;
-        });
-      }
-    }
-
-    // Double-click to open inline editor
-    const previewEl = card.querySelector('.card-content-preview');
-    if (previewEl) {
-      previewEl.addEventListener('dblclick', () => {
-        state.openInlineEditors.add(block.id);
-        updateSingleCard(block.id);
-      });
-    }
-
-    // Button actions
-    card.querySelector('.btn-card-edit').addEventListener('click', () => {
-      if (state.openInlineEditors.has(block.id)) {
-        state.openInlineEditors.delete(block.id);
-      } else {
-        state.openInlineEditors.add(block.id);
-      }
-      updateSingleCard(block.id);
-    });
-
-    card.querySelector('.btn-card-bridge').addEventListener('click', () => applyBridgeToBlock(block));
-    card.querySelector('.btn-card-contract').addEventListener('click', () => applyContractToBlock(block));
-    card.querySelector('.btn-card-condense').addEventListener('click', () => applyCondenseToBlock(block));
-
-    const revertBtn = card.querySelector('.btn-card-revert');
-    if (revertBtn) {
-      revertBtn.addEventListener('click', () => revertBlockEdit(block.id));
-    }
-
-    // In-Card Inline Editor handlers
-    if (isInlineOpen) {
-      const editorDiv = card.querySelector(`#inline-editor-${block.id}`);
-      const textarea = editorDiv.querySelector('.inline-edit-textarea');
-      const newTokEl = editorDiv.querySelector('.inline-new-tok');
-
-      setTimeout(() => {
-        textarea.focus();
-        textarea.selectionStart = textarea.value.length;
-        textarea.selectionEnd = textarea.value.length;
-      }, 10);
-
-      const updateTok = () => {
-        const newTok = Math.max(1, Math.round(textarea.value.length / 3.6));
-        newTokEl.textContent = fmt(newTok);
-      };
-
-      textarea.addEventListener('input', updateTok);
-
-      // Keyboard shortcuts: Cmd+Enter to save, Esc to cancel
-      textarea.addEventListener('keydown', (e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-          e.preventDefault();
-          saveCurrentInlineEdit();
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          state.openInlineEditors.delete(block.id);
-          updateSingleCard(block.id);
-        }
-      });
-
-      editorDiv.querySelector('.btn-inline-bridge').addEventListener('click', () => {
-        textarea.value = block.suggestedBridge;
-        updateTok();
-      });
-
-      editorDiv.querySelector('.btn-inline-contract').addEventListener('click', async () => {
-        const cRes = await fetch('/api/context/contract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: block.text, filename: block.target })
-        }).then(r => r.json());
-        textarea.value = cRes.contract || block.suggestedBridge;
-        updateTok();
-      });
-
-      editorDiv.querySelector('.btn-inline-headtail').addEventListener('click', () => {
-        const lines = block.text.split('\n');
-        if (lines.length > 30) {
-          textarea.value = lines.slice(0, 15).join('\n') + `\n\n... [${lines.length - 30} lines condensed to eliminate context bloat] ...\n\n` + lines.slice(-15).join('\n');
-        } else {
-          textarea.value = block.text;
-        }
-        updateTok();
-      });
-
-      const autoHealBtn = editorDiv.querySelector('.btn-inline-autoheal');
-      if (autoHealBtn) {
-        autoHealBtn.addEventListener('click', async () => {
-          try {
-            const hRes = await fetch('/api/context/heal', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sid: state.sid, blockId: block.id, text: textarea.value })
-            }).then(r => r.json());
-            if (hRes.healedText) {
-              textarea.value = hRes.healedText;
-              updateTok();
-            }
-          } catch {}
-        });
-      }
-
-      // Anchor pills click to insert
-      editorDiv.querySelectorAll('.anchor-term-pill').forEach(pill => {
-        pill.addEventListener('click', () => {
-          const term = pill.dataset.term;
-          textarea.value += `\n[Preserved symbol: ${term}]`;
-          updateTok();
-        });
-      });
-
-      editorDiv.querySelector('.btn-inline-cancel').addEventListener('click', () => {
-        state.openInlineEditors.delete(block.id);
-        updateSingleCard(block.id);
-      });
-
-      const saveCurrentInlineEdit = () => {
-        const newText = textarea.value;
-        const newTok = Math.max(1, Math.round(newText.length / 3.6));
-        state.stagedEdits.set(block.id, {
-          id: block.id,
-          recordIndex: block.recordIndex,
-          contentIndex: block.contentIndex,
-          newText,
-          origText: block.originalText,
-          tokBefore: block.tok,
-          tokAfter: newTok,
-          allocBefore: block.alloc,
-          allocAfter: newTok * block.liveTurns,
-          isBridged: true,
-          note: 'Inline edited'
-        });
-        state.openInlineEditors.delete(block.id);
-        updateSingleCard(block.id);
-        updateDeltaTracker();
-      };
-
-      editorDiv.querySelector('.btn-inline-save').addEventListener('click', saveCurrentInlineEdit);
-    }
-
-    return card;
-  }
-
-  function escapeHtml(str) {
-    if (!str) return '';
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  async function applyContractToBlock(block) {
-    const cRes = await fetch('/api/context/contract', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: block.text, filename: block.target })
-    }).then(r => r.json());
-
-    let contractText = cRes.contract || block.suggestedBridge;
-    const newTok = Math.max(1, Math.round(contractText.length / 3.6));
-
-    state.stagedEdits.set(block.id, {
-      id: block.id,
-      recordIndex: block.recordIndex,
-      contentIndex: block.contentIndex,
-      newText: contractText,
-      origText: block.originalText,
-      tokBefore: block.tok,
-      tokAfter: newTok,
-      allocBefore: block.alloc,
-      allocAfter: newTok * block.liveTurns,
-      isBridged: true,
-      note: 'Extracted interface contract'
-    });
-
-    updateSingleCard(block.id);
-    updateDeltaTracker();
-  }
-
-  function applyBridgeToBlock(block) {
-    const bridgeText = block.suggestedBridge || `[Context Bridge: Condensed ${block.chars} chars (${block.tool}) to maintain continuity]`;
-    const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
-    state.stagedEdits.set(block.id, {
-      id: block.id,
-      recordIndex: block.recordIndex,
-      contentIndex: block.contentIndex,
-      newText: bridgeText,
-      origText: block.originalText,
-      tokBefore: block.tok,
-      tokAfter: newTok,
-      allocBefore: block.alloc,
-      allocAfter: newTok * block.liveTurns,
-      isBridged: true,
-      note: 'Applied smart bridge'
-    });
-
-    updateSingleCard(block.id);
-    updateDeltaTracker();
-  }
-
-  function applyCondenseToBlock(block) {
-    const lines = block.text.split('\n');
-    let condensedText = block.text;
-    if (lines.length > 30) {
-      const head = lines.slice(0, 15).join('\n');
-      const tail = lines.slice(-15).join('\n');
-      condensedText = `${head}\n\n... [${lines.length - 30} lines condensed to eliminate context bloat] ...\n\n${tail}`;
-    } else {
-      condensedText = block.suggestedBridge;
-    }
-
-    const newTok = Math.max(1, Math.round(condensedText.length / 3.6));
-    state.stagedEdits.set(block.id, {
-      id: block.id,
-      recordIndex: block.recordIndex,
-      contentIndex: block.contentIndex,
-      newText: condensedText,
-      origText: block.originalText,
-      tokBefore: block.tok,
-      tokAfter: newTok,
-      allocBefore: block.alloc,
-      allocAfter: newTok * block.liveTurns,
-      isBridged: true,
-      note: 'Condensed head & tail'
-    });
-
-    updateSingleCard(block.id);
-    updateDeltaTracker();
-  }
-
-  function revertBlockEdit(blockId) {
-    state.stagedEdits.delete(blockId);
-    state.openInlineEditors.delete(blockId);
-    updateSingleCard(blockId);
-    updateDeltaTracker();
-  }
-
-  async function synthesizeRegion(regionId) {
-    if (!state.sid || state.sid === 'all') return;
-    try {
-      const res = await fetch('/api/context/synthesize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sid: state.sid, regionId })
-      }).then(r => r.json());
-
-      if (res.ok && res.edits) {
-        for (const edit of res.edits) {
-          state.stagedEdits.set(edit.id, edit);
-          updateSingleCard(edit.id);
-        }
-        updateDeltaTracker();
-      }
-    } catch (err) {
-      console.error('Error synthesizing region:', err);
-    }
-  }
-
-  async function autoHealAllEdits() {
-    if (state.stagedEdits.size === 0) return;
-    try {
-      const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
-        id: e.id,
-        newText: e.newText
-      }));
-      const valRes = await fetch('/api/context/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sid: state.sid, edits: editsArray })
-      }).then(r => r.json());
-
-      if (valRes.warnings && valRes.warnings.length > 0) {
-        const missingByBlock = new Map();
-        for (const w of valRes.warnings) {
-          if (!missingByBlock.has(w.blockId)) missingByBlock.set(w.blockId, new Set());
-          missingByBlock.get(w.blockId).add(w.missingTerm);
-        }
-
-        for (const [blockId, termsSet] of missingByBlock.entries()) {
-          const edit = state.stagedEdits.get(blockId);
-          if (!edit) continue;
-          const blk = state.contextData.blocks.find(b => b.id === blockId);
-          const terms = Array.from(termsSet).slice(0, 10);
-          edit.newText = edit.newText.trim() + `\n[Continuity Anchors: ${terms.join(', ')}]`;
-          edit.tokAfter = Math.max(1, Math.round(edit.newText.length / 3.6));
-          if (blk) edit.allocAfter = edit.tokAfter * blk.liveTurns;
-          state.stagedEdits.set(blockId, edit);
-          updateSingleCard(blockId);
-        }
-        updateDeltaTracker();
-      }
-    } catch (err) {
-      console.error('Error auto-healing edits:', err);
-    }
-  }
-
-  async function openSimulationModal() {
-    if (!state.sid || state.sid === 'all') return;
-    try {
-      const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
-        id: e.id,
-        newText: e.newText,
-        tokBefore: e.tokBefore,
-        tokAfter: e.tokAfter
-      }));
-      const simRes = await fetch('/api/context/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sid: state.sid, edits: editsArray })
-      }).then(r => r.json());
-
-      simOrigTok.textContent = fmt(simRes.totalOriginalTok);
-      simNewTok.textContent = fmt(simRes.totalSimulatedTok);
-      simSavedTok.textContent = `${fmt(simRes.savedTok)} tok`;
-      simPctSaved.textContent = `${simRes.pctSaved}%`;
-
-      if (simRes.continuity.isClean) {
-        simContinuityBadge.className = 'sim-badge ok';
-        simContinuityBadge.textContent = '🛡️ 100% Continuity Verified (Zero Jumps)';
-      } else {
-        simContinuityBadge.className = 'sim-badge warn';
-        simContinuityBadge.textContent = `⚠️ Continuity: ${simRes.continuity.healthScore}% (${simRes.continuity.warnings.length} anchors missing)`;
-      }
-
-      simStream.innerHTML = '';
-      simRes.turns.forEach(turn => {
-        const turnCard = document.createElement('div');
-        turnCard.className = `sim-turn-card ${turn.role || 'assistant'}`;
-        turnCard.innerHTML = `
-          <div class="sim-turn-header">
-            <span><strong>Turn ${turn.turn}</strong> · ${turn.role === 'user' ? '👤 User' : '🤖 Assistant'}</span>
-            <span>${fmt(turn.tok)} tok</span>
-          </div>
-          ${turn.messages.map(m => `
-            <div class="sim-msg-item ${m.isEdited ? 'edited' : ''}">
-              ${m.isEdited ? `<div class="sim-msg-tag">✓ BRIDGED CONTEXT (${m.tool || m.kind})</div>` : ''}
-              ${escapeHtml(m.text)}
-            </div>
-          `).join('')}
-        `;
-        simStream.appendChild(turnCard);
-      });
-
-      simModal.classList.remove('hidden');
-    } catch (err) {
-      console.error(err);
-      alert('Failed to simulate resumed session');
-    }
-  }
-
-  async function updateDeltaTracker() {
-    if (!state.contextData) {
-      deltaOrigTok.textContent = '0 tok';
-      deltaNewTok.textContent = '0 tok';
-      deltaSavedTok.textContent = '0 tok (0%)';
-      btnForkJumpfree.disabled = true;
-      stagedCountLabel.textContent = '0';
-      deltaContinuityStatus.textContent = '100% Clean (Zero Jumps)';
-      return;
-    }
-
-    const origTok = state.contextData.totalTokens || 0;
-    let savedTok = 0;
-
-    for (const edit of state.stagedEdits.values()) {
-      savedTok += (edit.tokBefore - edit.tokAfter);
-    }
-
-    const newTok = Math.max(0, origTok - savedTok);
-    const pct = origTok > 0 ? ((savedTok / origTok) * 100).toFixed(1) : 0;
-
-    deltaOrigTok.textContent = `${fmt(origTok)} tok`;
-    deltaNewTok.textContent = `${fmt(newTok)} tok`;
-    deltaSavedTok.textContent = `${fmt(savedTok)} tok (-${pct}%)`;
-
-    stagedCountLabel.textContent = state.stagedEdits.size;
-    btnForkJumpfree.disabled = state.stagedEdits.size === 0;
-
-    // Validate Continuity with server
-    if (state.stagedEdits.size > 0) {
-      try {
-        const editsArray = Array.from(state.stagedEdits.values()).map(e => ({
-          id: e.id,
-          newText: e.newText
-        }));
-        const valRes = await fetch('/api/context/validate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sid: state.sid, edits: editsArray })
-        }).then(r => r.json());
-
-        if (valRes.isClean) {
-          deltaContinuityStatus.textContent = `100% Verified (Zero Jumps)`;
-          deltaContinuityStatus.style.color = '#4ec9b0';
-        } else {
-          deltaContinuityStatus.textContent = `Continuity: ${valRes.healthScore}% (${valRes.warnings.length} anchor terms suggested)`;
-          deltaContinuityStatus.style.color = '#ff9800';
-          deltaContinuityStatus.title = valRes.warnings.map(w => w.message).join('\n');
-        }
-      } catch {}
-    } else {
-      deltaContinuityStatus.textContent = `100% Clean (Zero Jumps)`;
-      deltaContinuityStatus.style.color = '#4ec9b0';
-    }
-  }
-
-  // ==========================================
-  // WIZTREE ENGINE & TREEMAP
-  // ==========================================
-
-  function renderTreeTable() {
-    treeTbody.innerHTML = '';
-    if (!state.currentTree) return;
-
-    function walk(node, depth, parentKey) {
-      const fullKey = parentKey ? `${parentKey}/${node.key}` : node.key;
-      const isExpanded = state.expandedNodes.has(fullKey);
-      const hasKids = node.children && node.children.length > 0;
-
-      const tr = document.createElement('tr');
-      tr.dataset.key = fullKey;
-      if (state.selectedNodeKey === fullKey) tr.classList.add('selected');
-
-      const tdName = document.createElement('td');
-      tdName.style.paddingLeft = `${depth * 18 + 8}px`;
-
-      const titleSpan = document.createElement('span');
-      titleSpan.className = 'tree-node-title';
-
-      if (hasKids) {
-        const toggle = document.createElement('span');
-        toggle.className = 'tree-toggle';
-        toggle.textContent = isExpanded ? '[-] ' : '[+] ';
-        toggle.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (isExpanded) state.expandedNodes.delete(fullKey);
-          else state.expandedNodes.add(fullKey);
-          renderTreeTable();
-        });
-        titleSpan.appendChild(toggle);
-      } else {
-        const spacer = document.createElement('span');
-        spacer.className = 'tree-toggle';
-        spacer.textContent = '    ';
-        titleSpan.appendChild(spacer);
-      }
-
-      const icon = document.createElement('span');
-      icon.className = 'tree-icon';
-      icon.textContent = hasKids ? (isExpanded ? '📂' : '📁') : '📄';
-      titleSpan.appendChild(icon);
-
-      const label = document.createElement('span');
-      label.textContent = node.name;
-      titleSpan.appendChild(label);
-      tdName.appendChild(titleSpan);
-
-      const tdPct = document.createElement('td');
-      const pctVal = node.pct || 0;
-      tdPct.innerHTML = `
-        <div class="col-pct-bar">
-          <div class="pct-bar-bg"><div class="pct-bar-fill" style="width: ${fmtPct(pctVal)};"></div></div>
-          <span>${fmtPct(pctVal)}</span>
-        </div>
-      `;
-
-      const tdSize = document.createElement('td');
-      tdSize.textContent = fmt(node.tok);
-
-      const tdAlloc = document.createElement('td');
-      tdAlloc.textContent = fmt(node.alloc);
-
-      const tdItems = document.createElement('td');
-      tdItems.textContent = node.n ? node.n.toLocaleString() : '1';
-
-      tr.appendChild(tdName);
-      tr.appendChild(tdPct);
-      tr.appendChild(tdSize);
-      tr.appendChild(tdAlloc);
-      tr.appendChild(tdItems);
-
-      tr.addEventListener('click', () => {
-        state.selectedNodeKey = fullKey;
-        document.querySelectorAll('#tree-tbody tr').forEach(r => r.classList.remove('selected'));
-        tr.classList.add('selected');
-
-        state.zoomStack = [fullKey];
-        renderBreadcrumb();
-        renderTreemap();
-      });
-
-      treeTbody.appendChild(tr);
-
-      if (hasKids && isExpanded) {
-        node.children.forEach(child => walk(child, depth + 1, fullKey));
-      }
-    }
-
-    walk(state.currentTree, 0, '');
-  }
-
-  function renderKindTable() {
-    kindTbody.innerHTML = '';
-    const byKind = new Map();
-
-    state.currentChunks.forEach(c => {
-      const k = c.tool ? `tool:${c.tool}` : (c.sub || c.cat || c.kind);
-      const e = byKind.get(k) || { key: k, tok: 0, alloc: 0, count: 0, cat: c.cat, tool: c.tool };
-      e.tok += c.tok || 0;
-      e.alloc += c.alloc || 0;
-      e.count++;
-      byKind.set(k, e);
-    });
-
-    const rows = Array.from(byKind.values()).sort((a, b) => b[state.metric] - a[state.metric]);
-    const totalAlloc = rows.reduce((a, r) => a + r.alloc, 0) || 1;
-
-    rows.forEach(r => {
-      const tr = document.createElement('tr');
-      const color = getColor({ sub: r.key, cat: r.cat, tool: r.tool });
-
-      tr.innerHTML = `
-        <td style="text-align: center;"><span class="color-swatch" style="background: ${color};"></span></td>
-        <td><strong>${r.key}</strong></td>
-        <td>${fmtPct(r.alloc / totalAlloc)}</td>
-        <td>${fmt(r.tok)}</td>
-        <td>${fmt(r.alloc)}</td>
-        <td>${r.count.toLocaleString()}</td>
-      `;
-
-      tr.addEventListener('click', () => {
-        state.zoomStack = [`kind:${r.key}`];
-        renderBreadcrumb();
-        renderTreemap();
-      });
-
-      kindTbody.appendChild(tr);
-    });
-  }
-
-  function renderProjectsTable() {
-    projectsTbody.innerHTML = '';
-    const byProj = new Map();
-
-    state.sessions.forEach(s => {
-      const e = byProj.get(s.project) || { project: s.project, name: s.projectName, tok: 0, alloc: 0, sessions: 0 };
-      e.tok += s.tok;
-      e.alloc += s.alloc;
-      e.sessions++;
-      byProj.set(s.project, e);
-    });
-
-    const rows = Array.from(byProj.values()).sort((a, b) => b.alloc - a.alloc);
-    const totalAlloc = state.modelStats.alloc || 1;
-
-    rows.forEach(r => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td><strong>${r.name}</strong></td>
-        <td>${fmtPct(r.alloc / totalAlloc)}</td>
-        <td>${fmt(r.tok)}</td>
-        <td>${fmt(r.alloc)}</td>
-        <td>${r.sessions}</td>
-      `;
-      tr.addEventListener('click', () => {
-        const firstSess = state.sessions.find(s => s.project === r.project);
-        if (firstSess) {
-          sessionSelect.value = firstSess.sid;
-          sessionSelect.dispatchEvent(new Event('change'));
-        }
-      });
-      projectsTbody.appendChild(tr);
-    });
-  }
-
-  function renderForksTable() {
-    forksTbody.innerHTML = '';
-    forksCountBadge.textContent = state.forks.length;
-
-    if (!state.forks || state.forks.length === 0) {
-      forksTbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#888;padding:20px;">No forked sessions yet. Edit and fork to resume smaller contexts.</td></tr>`;
-      return;
-    }
-
-    state.forks.forEach(f => {
-      const tr = document.createElement('tr');
-      const dateStr = new Date(f.createdAt).toLocaleDateString() + ' ' + new Date(f.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-      tr.innerHTML = `
-        <td><code style="color:#4ec9b0;">${f.forkSid.slice(0, 8)}</code></td>
-        <td>${f.projectName}</td>
-        <td style="color:#4caf50;">+${fmt(f.savedTok)} tok</td>
-        <td style="color:#888;">${dateStr}</td>
-        <td>
-          <button class="wiz-btn small primary btn-resume-fork" data-sid="${f.forkSid}">Resume</button>
-          <button class="wiz-btn small danger btn-revert-fork" data-sid="${f.forkSid}">Revert</button>
-        </td>
-      `;
-
-      tr.querySelector('.btn-resume-fork').addEventListener('click', (e) => {
-        e.stopPropagation();
-        navigator.clipboard.writeText(`claude --resume ${f.forkSid}`);
-        alert(`Copied to clipboard:\nclaude --resume ${f.forkSid}`);
-      });
-
-      tr.querySelector('.btn-revert-fork').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (confirm(`Revert and delete fork ${f.forkSid.slice(0, 8)}?`)) {
-          await fetch('/api/revert', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ forkSid: f.forkSid })
-          });
-          state.forks = await fetch('/api/forks').then(r => r.json());
-          renderForksTable();
-          await loadAllData();
-        }
-      });
-
-      forksTbody.appendChild(tr);
-    });
-  }
-
-  function renderFindings() {
-    findingsContainer.innerHTML = '';
-    const prov = state.findings.proven || [];
-    const inf = state.findings.inferred || [];
-    findingsCountBadge.textContent = prov.length + inf.length;
-
-    function createFindingCard(item, tier) {
-      const card = document.createElement('div');
-      card.className = `finding-card tier-${tier}`;
-
-      const check = document.createElement('input');
-      check.type = 'checkbox';
-      check.className = 'finding-check';
-      const hasTuids = item.tuids && item.tuids.length > 0;
-      check.disabled = !hasTuids;
-
-      if (hasTuids && item.tuids.every(id => state.selectedTuids.has(id))) {
-        check.checked = true;
-      }
-
-      check.addEventListener('change', () => {
-        if (!item.tuids) return;
-        if (check.checked) {
-          item.tuids.forEach(id => state.selectedTuids.add(id));
-        } else {
-          item.tuids.forEach(id => state.selectedTuids.delete(id));
-        }
-        updateReclaimSummary();
-      });
-
-      const body = document.createElement('div');
-      body.className = 'finding-content';
-
-      const hdr = document.createElement('div');
-      hdr.className = 'finding-header';
-
-      const title = document.createElement('span');
-      title.className = 'finding-title';
-      title.textContent = item.title;
-
-      const badge = document.createElement('span');
-      badge.className = `finding-badge tier-${tier}`;
-      badge.textContent = `Tier ${tier}: Saves ${fmt(item.saves)}`;
-
-      hdr.appendChild(title);
-      hdr.appendChild(badge);
-      body.appendChild(hdr);
-
-      if (item.evidence && item.evidence.length) {
-        const ul = document.createElement('ul');
-        ul.className = 'finding-evidence';
-        item.evidence.forEach(e => {
-          const li = document.createElement('li');
-          li.textContent = `• ${e}`;
-          ul.appendChild(li);
-        });
-        body.appendChild(ul);
-      }
-
-      if (item.proxy) {
-        const p = document.createElement('div');
-        p.className = 'finding-proxy';
-        p.textContent = item.proxy;
-        body.appendChild(p);
-      }
-
-      if (item.how) {
-        const h = document.createElement('div');
-        h.className = 'finding-how';
-        h.textContent = `Action: ${item.how}`;
-        body.appendChild(h);
-      }
-
-      card.appendChild(check);
-      card.appendChild(body);
-      return card;
-    }
-
-    prov.forEach(p => findingsContainer.appendChild(createFindingCard(p, 1)));
-    inf.forEach(i => findingsContainer.appendChild(createFindingCard(i, 2)));
-
-    updateReclaimSummary();
-  }
-
-  function updateReclaimSummary() {
-    let tokSaved = 0;
-    let count = 0;
-    const allFindings = [...state.findings.proven, ...state.findings.inferred];
-
-    allFindings.forEach(f => {
-      if (f.tuids && f.tuids.some(id => state.selectedTuids.has(id))) {
-        tokSaved += f.saves || 0;
-        count++;
-      }
-    });
-
-    reclaimSelectedSavings.textContent = `${fmt(tokSaved)} (${count} items selected)`;
-    btnPruneSelected.disabled = state.selectedTuids.size === 0 || state.sid === 'all';
-  }
-
-  btnPruneSelected.addEventListener('click', async () => {
-    if (state.selectedTuids.size === 0 || state.sid === 'all') return;
-    if (confirm(`Tombstone ${state.selectedTuids.size} duplicate/fat results and fork session?`)) {
-      const res = await fetch('/api/prune', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sid: state.sid,
-          tuids: Array.from(state.selectedTuids),
-          note: 'Pruned findings'
-        })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        successCmdText.textContent = data.resumeCmd;
-        successTokSaved.textContent = `${fmt(data.savedTok)} tokens reclaimed`;
-        successModal.classList.remove('hidden');
-        state.forks = await fetch('/api/forks').then(r => r.json());
-        renderForksTable();
-      }
-    }
-  });
-
-  // Treemap Breadcrumbs
-  function renderBreadcrumb() {
-    treemapBreadcrumb.innerHTML = '';
-    const rootCrumb = document.createElement('span');
-    rootCrumb.className = `crumb ${state.zoomStack.length === 0 ? 'active' : ''}`;
-    rootCrumb.textContent = state.sid === 'all' ? '[All Context]' : `[Session ${state.sid.slice(0, 8)}]`;
-    rootCrumb.addEventListener('click', () => {
-      state.zoomStack = [];
-      renderBreadcrumb();
-      renderTreemap();
-    });
-    treemapBreadcrumb.appendChild(rootCrumb);
-
-    state.zoomStack.forEach((z, idx) => {
-      const sep = document.createElement('span');
-      sep.textContent = ' > ';
-      treemapBreadcrumb.appendChild(sep);
-
-      const crumb = document.createElement('span');
-      crumb.className = `crumb ${idx === state.zoomStack.length - 1 ? 'active' : ''}`;
-      crumb.textContent = z;
-      crumb.addEventListener('click', () => {
-        state.zoomStack = state.zoomStack.slice(0, idx + 1);
-        renderBreadcrumb();
-        renderTreemap();
-      });
-      treemapBreadcrumb.appendChild(crumb);
-    });
-  }
-
-  // Squarified Treemap Canvas Engine
-  let ctx = null;
-  let dpr = 1;
-
-  function setupCanvas() {
-    ctx = treemapCanvas.getContext('2d');
-    resizeCanvas();
-    setupCanvasEvents();
-  }
-
-  function resizeCanvas() {
-    const rect = treemapContainer.getBoundingClientRect();
-    dpr = window.devicePixelRatio || 1;
-    treemapCanvas.width = rect.width * dpr;
-    treemapCanvas.height = rect.height * dpr;
-    treemapCanvas.style.width = `${rect.width}px`;
-    treemapCanvas.style.height = `${rect.height}px`;
-  }
-
-  function layoutTreemap(items, x, y, width, height) {
-    const rects = [];
-    if (!items.length || width <= 0 || height <= 0) return rects;
-
-    const totalValue = items.reduce((sum, item) => sum + item.value, 0);
-    if (totalValue <= 0) return rects;
-
-    function squarify(children, row, w, rx, ry, rw, rh) {
-      if (children.length === 0) {
-        layoutRow(row, w, rx, ry, rw, rh);
+  // Marked totals per node, recomputed whenever marks change (O(n), cheap).
+  function recount() {
+    const walk = (n) => {
+      if (!n.kids) {
+        n._d = canDelete(n) ? 1 : 0; n._dt = saveOf(n);
+        n._m = isMarked(n) ? 1 : 0; n._mt = markedSave(n); n._mk = n._mt > 0 || n._m ? 1 : 0;
         return;
       }
-      const c = children[0];
-      const newRow = [...row, c];
-      if (row.length === 0 || worst(row, w) >= worst(newRow, w)) {
-        squarify(children.slice(1), newRow, w, rx, ry, rw, rh);
-      } else {
-        const [nx, ny, nw, nh] = layoutRow(row, w, rx, ry, rw, rh);
-        squarify(children, [], Math.min(nw, nh), nx, ny, nw, nh);
-      }
-    }
+      n._d = 0; n._dt = 0; n._m = 0; n._mt = 0; n._mk = 0;
+      for (const k of n.kids) { walk(k); n._d += k._d; n._dt += k._dt; n._m += k._m; n._mt += k._mt; n._mk += k._mk; }
+    };
+    S.roots.forEach(walk);
+  }
+  const deletableLeaves = (n, out = []) => {
+    if (!n.kids) { if (canDelete(n)) out.push(n); return out; }
+    for (const k of n.kids) deletableLeaves(k, out);
+    return out;
+  };
 
-    function worst(row, w) {
-      const s = row.reduce((sum, item) => sum + item.area, 0);
-      if (s === 0 || w === 0) return Infinity;
-      let rMax = 0, rMin = Infinity;
-      row.forEach(item => {
-        rMax = Math.max(rMax, item.area);
-        rMin = Math.min(rMin, item.area);
-      });
-      const w2 = w * w;
-      const s2 = s * s;
-      return Math.max((w2 * rMax) / s2, s2 / (w2 * rMin));
-    }
-
-    function layoutRow(row, w, rx, ry, rw, rh) {
-      const rowSum = row.reduce((sum, item) => sum + item.area, 0);
-      const isHorizontal = rw === w;
-      const rowThickness = w > 0 ? rowSum / w : 0;
-      let offset = 0;
-
-      row.forEach(item => {
-        const itemLen = rowThickness > 0 ? item.area / rowThickness : 0;
-        let ix, iy, iw, ih;
-        if (isHorizontal) {
-          ix = rx;
-          iy = ry + offset;
-          iw = rowThickness;
-          ih = itemLen;
-        } else {
-          ix = rx + offset;
-          iy = ry;
-          iw = itemLen;
-          ih = rowThickness;
-        }
-        rects.push({
-          ...item.raw,
-          x: ix,
-          y: iy,
-          w: iw,
-          h: ih,
-        });
-        offset += itemLen;
-      });
-
-      if (isHorizontal) {
-        return [rx + rowThickness, ry, rw - rowThickness, rh];
-      } else {
-        return [rx, ry + rowThickness, rw, rh - rowThickness];
-      }
-    }
-
-    const totalArea = width * height;
-    const prepared = items
-      .map(item => ({
-        raw: item,
-        value: item.value,
-        area: (item.value / totalValue) * totalArea,
-      }))
-      .filter(item => item.area > 0)
-      .sort((a, b) => b.value - a.value);
-
-    squarify(prepared, [], Math.min(width, height), x, y, width, height);
-    return rects;
+  // ------------------------------------------------------------- marking
+  function snapshot() {
+    S.undo.push({ marks: new Set(S.marks), ops: { ...S.ops } });
+    if (S.undo.length > 100) S.undo.shift();
+  }
+  function setMarks(leaves, on) {
+    snapshot();
+    for (const l of leaves) for (const a of actsOf(l)) { if (on) S.marks.add(akey(a)); else S.marks.delete(akey(a)); }
+    changed();
+  }
+  function toggleNode(n) {
+    if (isGrey(n)) { openMenuFor(n); return; }
+    let leaves = deletableLeaves(n);
+    // on a task, ⌫ clears what tools produced and keeps the conversation
+    if (isTask(n) && leaves.some(isToolOutput)) leaves = leaves.filter(isToolOutput);
+    if (!S.parent.get(n.id)) { openMenuFor(n); return; }
+    if (!leaves.length) { toast(n.lock || 'Nothing here can be deleted.', true); return; }
+    const allOn = leaves.every(isMarked);
+    setMarks(leaves, !allOn);
+  }
+  function setOp(op, value) {
+    snapshot();
+    if (op === 'switch') S.ops.switchTip = value ? value : '';
+    else S.ops[op] = !!value;
+    changed();
+  }
+  function undo() {
+    const u = S.undo.pop();
+    if (!u) return;
+    S.marks = u.marks; S.ops = u.ops;
+    changed();
+  }
+  const opCount = () => (S.ops.uncompact ? 1 : 0) + (S.ops.slim ? 1 : 0) + (S.ops.switchTip ? 1 : 0);
+  function changed() {
+    recount();
+    renderTree(); renderTypes(); renderOverlay(); renderMeter(); renderStatus(); renderDetails();
+    if (!$('#drawer').classList.contains('hidden') && drawerMode === 'review') renderReview();
   }
 
-  function renderTreemap() {
-    if (!ctx) return;
-    const w = treemapCanvas.width;
-    const h = treemapCanvas.height;
+  // ------------------------------------------------------------ sessions
+  async function loadSessions() {
+    S.sessions = await api('/api/sessions');
+    S.sessions.sort((a, b) => String(b.lastTs || '').localeCompare(String(a.lastTs || '')));
+    try { S.forks = await api('/api/forks'); } catch { S.forks = []; }
+    $('#forks-count').textContent = S.forks.length ? String(S.forks.length) : '';
+  }
+  const forkOf = (sid) => S.forks.find(f => f.forkSid === sid);
+  // A fork reads best under its parent's first prompt (slimming may drop it).
+  function titleOf(s, depth = 0) {
+    if (!s) return '';
+    const f = forkOf(s.sid);
+    const p = f && depth < 8 && S.sessions.find(x => x.sid === f.parentSid);
+    return (p && titleOf(p, depth + 1)) || s.title || '';
+  }
 
-    ctx.save();
-    ctx.scale(dpr, dpr);
-    const canvasW = w / dpr;
-    const canvasH = h / dpr;
-
-    ctx.fillStyle = '#111113';
-    ctx.fillRect(0, 0, canvasW, canvasH);
-
-    let items = state.currentChunks;
-    if (state.zoomStack.length > 0) {
-      const currentZoom = state.zoomStack[state.zoomStack.length - 1];
-      if (currentZoom.startsWith('kind:')) {
-        const targetKind = currentZoom.slice(5);
-        items = items.filter(c => (c.tool ? `tool:${c.tool}` : (c.sub || c.cat || c.kind)) === targetKind);
-      } else {
-        const leafPart = currentZoom.split('/').pop();
-        items = items.filter(c => c.leaf === leafPart || c.sub === leafPart || c.cat === leafPart);
-      }
+  async function openSession(sid, { keepMarks = false } = {}) {
+    if (!sid) return;
+    if (!keepMarks && S.sid && sid !== S.sid && (S.marks.size || opCount())) {
+      if (!confirm('Switch session? Your marked deletions in this one will be cleared.')) return;
     }
+    S.sid = sid;
+    history.replaceState(null, '', `#${sid}`);
+    const s = S.sessions.find(x => x.sid === sid);
+    $('#session-title').textContent = titleOf(s) || sid.slice(0, 8);
+    $('#session-meta').textContent = s ? `${s.projectName} · ${ago(s.lastTs)}${forkOf(sid) ? ' · fork' : ''}` : '';
+    $('#tree-spacer').replaceChildren(h('div', { class: 'loading', text: 'Reading session…' }));
+    let map;
+    try { map = await api(`/api/map?sid=${encodeURIComponent(sid)}`); } catch (e) { toast(e.message, true); return; }
+    if (S.sid !== sid) return;
+    S.map = map;
+    S.actByKey = new Map();
+    const collect = (n) => { if (n.kids) return n.kids.forEach(collect); for (const a of actsOf(n)) S.actByKey.set(akey(a), a); };
+    collect(map.tree); collect(map.tasks);
+    S.marks = new Set(); S.ops = { uncompact: false, slim: false, switchTip: '' }; S.undo = [];
+    showView(S.view);
+  }
 
-    const layoutItems = items.map(c => {
-      const val = c[state.metric] || 1;
-      const label = c.target ? (c.target.split('/').pop() || c.target) : (c.tool || c.sub || c.kind);
-      return {
-        ...c,
-        value: val,
-        label,
-      };
-    }).filter(i => i.value > 0);
+  // Two views of the same context. Marks are per action, so they carry over.
+  function showView(view) {
+    S.view = view;
+    store.set('view', view);
+    document.querySelectorAll('#view-seg button').forEach(b => b.classList.toggle('on', b.dataset.view === view));
+    if (!S.map) return;
+    const main = view === 'tasks' ? S.map.tasks : S.map.tree;
+    S.roots = [main, ...(S.map.grey && S.map.grey.kids && S.map.grey.kids.length ? [S.map.grey] : [])];
+    index();
+    S.typeHi = null;
+    S.open = new Set(['root']);
+    if (view === 'types') for (const k of main.kids || []) S.open.add(k.id);
+    S.sel = 'root';
+    S.mapRoot = main;
+    $('#tree').scrollTop = 0;
+    recount();
+    layoutMap();
+    changed();
+  }
 
-    state.treemapRects = layoutTreemap(layoutItems, 2, 2, canvasW - 4, canvasH - 4);
+  // ---------------------------------------------------------------- meter
+  function renderMeter() {
+    const m = S.map;
+    if (!m) return;
+    const win = m.window, now = curRoot().tok, cut = curRoot()._mt || 0, after = now - cut;
+    $('#meter-now').textContent = `${fmt(now)} tokens`;
+    $('#meter-after').textContent = cut ? `→ ${fmt(after)}` : '';
+    $('#meter-of').textContent = `of ${fmt(win)} · ${pct(after, win)}`;
+    $('#meter-keep').style.width = `${Math.min(100, (100 * after) / win)}%`;
+    $('#meter-cut').style.width = `${Math.min(100 - Math.min(100, (100 * after) / win), (100 * cut) / win)}%`;
+    $('#meter').classList.toggle('over', after / win > 0.8);
+  }
 
-    state.treemapRects.forEach(r => {
-      if (r.w < 2 || r.h < 2) return;
-
-      const baseColor = getColor(r);
-      const isHovered = state.hoveredRect === r;
-
-      ctx.fillStyle = baseColor;
-      ctx.fillRect(r.x, r.y, r.w, r.h);
-
-      const grad = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
-      grad.addColorStop(0, 'rgba(255, 255, 255, 0.15)');
-      grad.addColorStop(1, 'rgba(0, 0, 0, 0.35)');
-      ctx.fillStyle = grad;
-      ctx.fillRect(r.x, r.y, r.w, r.h);
-
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = isHovered ? '#ffffff' : 'rgba(255, 255, 255, 0.4)';
-      ctx.beginPath();
-      ctx.moveTo(r.x + r.w, r.y);
-      ctx.lineTo(r.x, r.y);
-      ctx.lineTo(r.x, r.y + r.h);
-      ctx.stroke();
-
-      ctx.strokeStyle = isHovered ? '#ffff00' : 'rgba(0, 0, 0, 0.7)';
-      ctx.beginPath();
-      ctx.moveTo(r.x + r.w, r.y);
-      ctx.lineTo(r.x + r.w, r.y + r.h);
-      ctx.lineTo(r.x, r.y + r.h);
-      ctx.stroke();
-
-      if (r.w > 45 && r.h > 24) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(r.x + 3, r.y + 3, r.w - 6, r.h - 6);
-        ctx.clip();
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto';
-        ctx.fillText(r.label, r.x + 5, r.y + 14);
-
-        if (r.h > 36) {
-          ctx.font = '9px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto';
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
-          ctx.fillText(fmt(r[state.metric]), r.x + 5, r.y + 26);
-        }
-        ctx.restore();
-      }
+  // ----------------------------------------------------------------- tree
+  const ROW = 26;
+  function sortedKids(n) {
+    const { key, dir } = S.sort;
+    const k = [...n.kids];
+    if (key === 'name') k.sort((a, b) => dir * a.name.localeCompare(b.name));
+    else if (key === 'n') k.sort((a, b) => dir * (((a.kids ? a.n : 1) - (b.kids ? b.n : 1)) || (a.tok - b.tok)));
+    else if (key === 'turn') k.sort((a, b) => dir * ((a.ord != null && b.ord != null) ? a.ord - b.ord : (((a.turn || 0) - (b.turn || 0)) || (a.tok - b.tok))));
+    else k.sort((a, b) => dir * (a.tok - b.tok));
+    return k;
+  }
+  function flatten() {
+    const rows = [];
+    const walk = (n, d) => {
+      rows.push({ n, d });
+      if (n.kids && S.open.has(n.id)) for (const k of sortedKids(n)) walk(k, d + 1);
+    };
+    for (const r of S.roots) walk(r, 0);
+    S.rows = rows;
+  }
+  function renderTree() {
+    if (!S.map) return;
+    flatten();
+    const body = $('#tree'), spacer = $('#tree-spacer');
+    spacer.style.height = `${S.rows.length * ROW}px`;
+    const top = body.scrollTop, hgt = body.clientHeight || 400;
+    const a = Math.max(0, Math.floor(top / ROW) - 8), b = Math.min(S.rows.length, Math.ceil((top + hgt) / ROW) + 8);
+    const frag = document.createDocumentFragment();
+    for (let i = a; i < b; i++) frag.append(rowEl(S.rows[i], i));
+    spacer.replaceChildren(frag);
+    document.querySelectorAll('#thead .th').forEach(th => {
+      const on = th.dataset.sort === S.sort.key && !(th.classList.contains('c-pct'));
+      th.classList.toggle('sorted', on);
+      th.classList.toggle('asc', on && S.sort.dir === 1);
     });
+  }
+  function rowEl({ n, d }, i) {
+    const grey = isGrey(n);
+    const group = !!n.kids;
+    const marked = !group ? isMarked(n) : (n._d > 0 && n._m === n._d);
+    const parent = S.parent.get(n.id);
+    const cls = ['row', group && 'group', !parent && 'root', n.id === S.sel && 'sel', marked && 'marked', grey && 'greyrow'].filter(Boolean).join(' ');
+    const row = h('div', { class: cls, style: `top:${i * ROW}px`, 'data-id': n.id, role: 'treeitem', 'aria-level': String(d + 1) });
 
-    ctx.restore();
+    const name = h('div', { class: 'c-name', style: `padding-left:${8 + d * 16}px` });
+    if (group) {
+      const chev = h('span', { class: `chev${S.open.has(n.id) ? ' open' : ''}`, 'data-chev': '1' });
+      chev.append(svg(ICON.chev));
+      name.append(chev);
+    } else name.append(h('span', { class: 'chev' }));
+    if (parent) name.append(h('span', { class: 'sw', style: `background:${colorOf(n.t)}` }));
+    name.append(h('span', { class: 'nm', text: n.name, title: n.name }));
+    if (n.err) name.append(h('span', { class: 'err', text: 'error' }));
+    if (n.sub && !/^turn \d+$/.test(n.sub)) name.append(h('span', { class: 'sub', text: n.sub }));
+    if (isTask(n) && n.ts) name.append(h('span', { class: 'sub keep', text: taskSub(n) }));
+    if (n.latest) name.append(h('span', { class: 'tag', text: 'latest' }));
+    if (!group && n.stale && !marked) name.append(h('span', { class: 'tag old', text: 'out of date', title: n.stale }));
+    if (!group && !canDelete(n) && !grey) name.append(svg(ICON.lock, 'lockic'));
+    if (group && n._m && n._m < n._d) name.append(h('span', { class: 'sub', style: 'color:var(--danger)', text: `${n._m} of ${n._d} marked` }));
+    if (n.ops && opsOn(n)) name.append(h('span', { class: 'sub', style: 'color:var(--danger)', text: opsOn(n) }));
+
+    const base = parent ? parent.tok : (n.id === 'root' ? S.map.window : 0);
+    const p = base ? n.tok / base : 0;
+    const pctCell = h('div', { class: 'c-pct' });
+    if (base) {
+      const bar = h('div', { class: 'pbar' }, h('i', { style: `width:${Math.min(100, p * 100)}%` }));
+      if (n._mt && n.tok) bar.append(h('b', { style: `left:${Math.min(100, p * 100) * (1 - n._mt / n.tok)}%;width:${Math.min(100, p * 100) * (n._mt / n.tok)}%` }));
+      pctCell.append(h('div', { class: 'pct' }, bar, h('span', { text: pct(n.tok, base) })));
+    }
+    const tok = h('div', { class: 'c-tok' });
+    if (group && n._mt && n._m < n._d) tok.append(h('span', { class: 'minus', text: `−${fmt(n._mt)}` }));
+    tok.append(fmt(n.tok));
+    row.append(name, pctCell, tok,
+      h('div', { class: 'c-n', text: group ? n.n.toLocaleString() : '' }),
+      h('div', { class: 'c-turn', text: isTask(n) && n.from != null && n.from !== n.turn ? `${n.from}–${n.turn}` : (n.turn ? String(n.turn) : (group ? '' : '—')) }));
+    return row;
+  }
+  function taskSub(n) {
+    const bits = [ago(n.ts)];
+    if (!n.latest && n.ownFiles && !n.lastRef) bits.push('not mentioned since');
+    return bits.join(' · ');
+  }
+  function opsOn(n) {
+    if (!n.ops) return '';
+    const on = n.ops.filter(o => (o.op === 'switch' ? S.ops.switchTip === o.tip : S.ops[o.op]));
+    return on.length ? on.map(o => (o.op === 'slim' ? 'remove from file' : o.op === 'switch' ? 'switch here' : 'restore')).join(' · ') : '';
   }
 
-  function setupCanvasEvents() {
-    treemapCanvas.addEventListener('mousemove', e => {
-      const b = treemapCanvas.getBoundingClientRect();
-      const mx = e.clientX - b.left;
-      const my = e.clientY - b.top;
+  function select(id, { reveal = true, scroll = true, fromMap = false } = {}) {
+    const n = S.byId.get(id);
+    if (!n) return;
+    S.sel = id;
+    if (reveal) for (const a of ancestors(n)) S.open.add(a.id);
+    const r = rootOf(n);
+    if (r !== S.mapRoot) { S.mapRoot = r; layoutMap(); }
+    renderTree();
+    if (scroll) {
+      const i = S.rows.findIndex(x => x.n.id === id);
+      const body = $('#tree');
+      if (i >= 0) {
+        const y = i * ROW;
+        if (y < body.scrollTop + ROW || y > body.scrollTop + body.clientHeight - 2 * ROW) body.scrollTop = Math.max(0, y - body.clientHeight / 2);
+        renderTree();
+      }
+    }
+    if (!fromMap) S.hover = null;
+    renderOverlay(); renderStatus(); renderDetails(); renderPath();
+  }
+  function toggleOpen(n, open) {
+    if (!n.kids) return;
+    const want = open == null ? !S.open.has(n.id) : open;
+    if (want) S.open.add(n.id); else S.open.delete(n.id);
+    renderTree();
+  }
 
-      let found = null;
-      for (let i = state.treemapRects.length - 1; i >= 0; i--) {
-        const r = state.treemapRects[i];
-        if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
-          found = r;
+  function treeEvents() {
+    const body = $('#tree');
+    let raf = 0;
+    body.addEventListener('scroll', () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(renderTree); });
+    body.addEventListener('mousedown', (e) => {
+      const row = e.target.closest('.row');
+      if (!row) return;
+      const n = S.byId.get(row.dataset.id);
+      if (e.target.closest('[data-chev]')) { toggleOpen(n); e.preventDefault(); return; }
+      select(n.id, { scroll: false });
+    });
+    body.addEventListener('dblclick', (e) => {
+      const row = e.target.closest('.row');
+      if (row) toggleOpen(S.byId.get(row.dataset.id));
+    });
+    body.addEventListener('contextmenu', (e) => {
+      const row = e.target.closest('.row');
+      if (!row) return;
+      e.preventDefault();
+      const n = S.byId.get(row.dataset.id);
+      select(n.id, { scroll: false });
+      openMenu(n, e.clientX, e.clientY);
+    });
+    body.addEventListener('keydown', (e) => {
+      if (!S.rows.length) return;
+      const i = Math.max(0, S.rows.findIndex(r => r.n.id === S.sel));
+      const n = S.rows[i].n;
+      const go = (j) => { j = Math.max(0, Math.min(S.rows.length - 1, j)); select(S.rows[j].n.id); };
+      switch (e.key) {
+        case 'ArrowDown': go(i + 1); break;
+        case 'ArrowUp': go(i - 1); break;
+        case 'PageDown': go(i + Math.floor(body.clientHeight / ROW)); break;
+        case 'PageUp': go(i - Math.floor(body.clientHeight / ROW)); break;
+        case 'Home': go(0); break;
+        case 'End': go(S.rows.length - 1); break;
+        case 'ArrowRight': if (n.kids && !S.open.has(n.id)) toggleOpen(n, true); else go(i + 1); break;
+        case 'ArrowLeft': if (n.kids && S.open.has(n.id)) toggleOpen(n, false); else { const p = S.parent.get(n.id); if (p) select(p.id); } break;
+        case 'Enter': case ' ': toggleOpen(n); break;
+        case 'Delete': case 'Backspace': toggleNode(n); break;
+        case 'ContextMenu': {
+          const el = body.querySelector(`.row[data-id="${CSS.escape(n.id)}"]`);
+          const r = el ? el.getBoundingClientRect() : { left: 100, bottom: 100 };
+          openMenu(n, r.left + 40, r.bottom);
           break;
         }
+        default: return;
       }
+      e.preventDefault();
+    });
+    document.querySelectorAll('#thead .th').forEach(th => th.addEventListener('click', () => {
+      const key = th.dataset.sort;
+      S.sort = S.sort.key === key ? { key, dir: -S.sort.dir } : { key, dir: key === 'name' ? 1 : -1 };
+      renderTree();
+    }));
+  }
 
-      if (found !== state.hoveredRect) {
-        state.hoveredRect = found;
-        renderTreemap();
+  // ---------------------------------------------------------------- types
+  function typeRows() {
+    const by = new Map();
+    const each = (n) => {
+      if (n.kids) { n.kids.forEach(each); return; }
+      const r = by.get(n.t) || { t: n.t, tok: 0, n: 0, d: 0, m: 0, mt: 0 };
+      r.tok += n.tok; r.n++; if (canDelete(n)) r.d++; const ms = markedSave(n); if (ms) { r.m++; r.mt += ms; }
+      by.set(n.t, r);
+    };
+    each(S.mapRoot || S.map.tree);
+    return [...by.values()].sort((a, b) => b.tok - a.tok);
+  }
+  function renderTypes() {
+    if (!S.map) return;
+    const rows = typeRows();
+    const total = rows.reduce((a, r) => a + r.tok, 0);
+    const body = $('#types');
+    body.replaceChildren(...rows.map(r => {
+      const el = h('div', { class: `trow${S.typeHi === r.t ? ' on' : ''}${S.typeHi && S.typeHi !== r.t ? ' dim' : ''}`, 'data-t': r.t, title: 'Click to highlight in the map · right-click to delete' },
+        h('div', { class: 'c-type' }, h('span', { class: 'sw', style: `background:${colorOf(r.t)}` }), h('span', { class: 'nm', text: typeLabel(r.t) }),
+          r.m ? h('span', { class: 'sub', style: 'color:var(--danger)', text: `−${fmt(r.mt)}` }) : null),
+        h('div', { class: 'c-pct' }, h('div', { class: 'pct' }, h('div', { class: 'pbar' }, h('i', { style: `width:${total ? (100 * r.tok) / total : 0}%` })), h('span', { text: pct(r.tok, total) }))),
+        h('div', { class: 'c-tok num', text: fmt(r.tok) }),
+        h('div', { class: 'c-n num', text: r.n.toLocaleString() }));
+      return el;
+    }));
+  }
+  function typeEvents() {
+    const body = $('#types');
+    body.addEventListener('click', (e) => {
+      const row = e.target.closest('.trow');
+      if (!row) return;
+      S.typeHi = S.typeHi === row.dataset.t ? null : row.dataset.t;
+      renderTypes(); renderOverlay();
+    });
+    body.addEventListener('contextmenu', (e) => {
+      const row = e.target.closest('.trow');
+      if (!row) return;
+      e.preventDefault();
+      const t = row.dataset.t;
+      const leaves = [];
+      const each = (n) => { if (n.kids) n.kids.forEach(each); else if (n.t === t && canDelete(n)) leaves.push(n); };
+      each(S.mapRoot || S.map.tree);
+      openListMenu(typeLabel(t), leaves, e.clientX, e.clientY, { lock: 'Nothing of this type can be deleted.' });
+    });
+  }
+
+  // ---------------------------------------------------------------- menus
+  let menuItems = [], menuKb = -1;
+  function closeMenu() { $('#menu').classList.add('hidden'); menuItems = []; menuKb = -1; }
+  function showMenu(children, x, y) {
+    const m = $('#menu');
+    m.replaceChildren(...children);
+    m.classList.remove('hidden');
+    const r = m.getBoundingClientRect();
+    m.style.left = `${Math.max(6, Math.min(x, innerWidth - r.width - 6))}px`;
+    m.style.top = `${Math.max(6, Math.min(y, innerHeight - r.height - 6))}px`;
+    menuItems = [...m.querySelectorAll('.mi:not(:disabled), .chip')];
+    menuKb = -1;
+  }
+  const mi = (label, right, onclick, { danger = false, disabled = false, check = null, note = '', title = '' } = {}) => {
+    const b = h('button', { class: `mi${danger ? ' danger' : ''}`, disabled, title: title || null, role: 'menuitem' });
+    if (check !== null) b.append(h('span', { class: 'check' }, check ? svg(ICON.check) : ''));
+    const l = h('span', { class: 'ml', text: label });
+    if (note) l.append(h('span', { class: 'mnote', text: note }));
+    b.append(l);
+    if (right) b.append(h('span', { class: 'mr', text: right }));
+    if (onclick) b.addEventListener('click', () => { closeMenu(); onclick(); });
+    return b;
+  };
+  const mh = (t) => h('div', { class: 'mh', text: t });
+  const msep = () => h('div', { class: 'msep' });
+
+  // Size thresholds and "keep the latest" for any set of deletable leaves.
+  function bulkItems(leaves) {
+    const out = [];
+    if (leaves.length >= 3) {
+      const chips = [];
+      for (const th of [1000, 2500, 5000, 10000, 25000, 50000]) {
+        const big = leaves.filter(l => l.tok >= th && !isMarked(l));
+        const allBig = leaves.filter(l => l.tok >= th);
+        if (!big.length || allBig.length === leaves.length) continue;
+        chips.push(h('button', { class: 'chip', title: `Delete the ${big.length} item(s) of at least ${fmt(th)} tokens` , onclick: () => { closeMenu(); setMarks(big, true); } }, `≥ ${fmt(th)} · ${big.length}`));
       }
+      if (chips.length) out.push(mh('Delete only the larger ones'), h('div', { class: 'mchips' }, chips));
+    }
+    const stale = leaves.filter(l => l.stale && !isMarked(l));
+    if (stale.length) out.push(mi('Delete out-of-date copies', `−${fmt(stale.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(stale, true), { danger: true, note: `${stale.length} item(s) a later turn replaced: the file was read again or changed, or the command ran again` }));
+    return out;
+  }
 
-      if (found) {
-        treemapTooltip.classList.remove('hidden');
-        treemapTooltip.style.left = `${Math.min(mx + 14, b.width - 240)}px`;
-        treemapTooltip.style.top = `${Math.min(my + 14, b.height - 180)}px`;
+  function openListMenu(title, leaves, x, y, { lock = '' } = {}) {
+    const items = [mh(title)];
+    const off = leaves.filter(l => !isMarked(l)), on = leaves.filter(isMarked);
+    if (!leaves.length) items.push(mi(lock || 'Nothing here can be deleted', '', null, { disabled: true }));
+    if (off.length) items.push(mi(leaves.length === 1 ? 'Delete' : `Delete all ${leaves.length}`, `−${fmt(off.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(off, true), { danger: true }));
+    if (on.length) items.push(mi(on.length === 1 ? 'Keep' : `Keep all ${on.length}`, `+${fmt(on.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(on, false)));
+    items.push(...bulkItems(leaves));
+    showMenu(items, x, y);
+  }
 
-        const targetLabel = found.target ? `<div><span class="tooltip-val" style="font-size:10px;color:#9cdcfe;">${found.target}</span></div>` : '';
-        treemapTooltip.innerHTML = `
-          <div class="tooltip-title">${found.tool || found.sub || found.kind}</div>
-          ${targetLabel}
-          <div class="tooltip-row"><span>Category:</span><span class="tooltip-val">${found.cat || '(none)'}</span></div>
-          <div class="tooltip-row"><span>Distinct Size:</span><span class="tooltip-val">${fmt(found.tok)} tokens</span></div>
-          <div class="tooltip-row"><span>Allocated:</span><span class="tooltip-val">${fmt(found.alloc)} tokens</span></div>
-          <div class="tooltip-row"><span>Residency:</span><span class="tooltip-val">${found.live || 1} turns</span></div>
-          <div class="tooltip-row"><span>Action:</span><span class="tooltip-val" style="color:#4caf50;">Click to jump to Context Editor ➔</span></div>
-        `;
+  function openMenuFor(n) {
+    const el = document.querySelector(`.row[data-id="${CSS.escape(n.id)}"]`);
+    const r = el ? el.getBoundingClientRect() : { left: innerWidth / 3, bottom: innerHeight / 3 };
+    openMenu(n, r.left + 60, r.bottom);
+  }
+
+  function openMenu(n, x, y) {
+    const items = [];
+    if (isGrey(n)) {
+      const g = n.ops ? n : ancestors(n).find(a => a.ops);
+      items.push(mh(g ? g.name : n.name));
+      if (!g) items.push(mi('Pick one of the groups inside to act on it', '', null, { disabled: true }));
+      else for (const o of g.ops) {
+        const on = o.op === 'switch' ? S.ops.switchTip === o.tip : S.ops[o.op];
+        items.push(mi(o.label, '', () => setOp(o.op, on ? false : (o.op === 'switch' ? o.tip : true)), { check: !!on, note: o.note }));
+      }
+      showMenu(items, x, y);
+      return;
+    }
+    const leaves = deletableLeaves(n);
+    if (!n.kids) {
+      items.push(mh(n.name));
+      if (canDelete(n)) {
+        const on = isMarked(n);
+        const verb = isShrink(n) ? 'Shrink this call' : 'Delete';
+        items.push(on ? mi('Keep', `+${fmt(saveOf(n))}`, () => setMarks([n], false)) : mi(verb, `−${fmt(saveOf(n))}`, () => setMarks([n], true), { danger: true, note: n.stale || n.warn || '' }));
+      } else items.push(mi('Can’t delete this', '', null, { disabled: true, note: n.lock || '' }));
+    } else if (!S.parent.get(n.id)) {
+      items.push(mh(n.name));
+      if (S.view === 'tasks') items.push(...cleanupItems());
+      else items.push(mi('Pick a part of the context to delete', '', null, { disabled: true, note: 'Right-click a group or an item; the whole context is never deleted at once.' }));
+      const stale = leaves.filter(l => l.stale && !isMarked(l));
+      if (stale.length) items.push(mi('Delete every out-of-date copy', `−${fmt(stale.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(stale, true), { danger: true, note: `${stale.length} item(s) a later turn replaced` }));
+    } else if (isTask(n)) {
+      items.push(mh(n.name));
+      items.push(...taskItems(n));
+    } else {
+      items.push(mh(n.name));
+      const off = leaves.filter(l => !isMarked(l)), on = leaves.filter(isMarked);
+      if (!leaves.length) items.push(mi('Nothing here can be deleted', '', null, { disabled: true, note: firstLock(n) }));
+      if (off.length) items.push(mi(leaves.length === 1 ? 'Delete' : `Delete all ${leaves.length}`, `−${fmt(off.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(off, true), { danger: true, note: leaves.length < countLeaves(n) ? `${countLeaves(n) - leaves.length} item(s) here can’t be deleted and stay` : '' }));
+      if (on.length) items.push(mi(on.length === 1 ? 'Keep' : `Keep all ${on.length}`, `+${fmt(on.reduce((a, l) => a + saveOf(l), 0))}`, () => setMarks(on, false)));
+      items.push(...bulkItems(leaves));
+    }
+    // From the map you click a leaf; offer the groups above it too.
+    const ups = ancestors(n).filter(a => S.parent.get(a.id) && deletableLeaves(a).length > (n.kids ? leaves.length : 1)).slice(0, 2);
+    if (ups.length) {
+      items.push(msep());
+      for (const a of ups) {
+        const al = deletableLeaves(a), off = al.filter(l => !isMarked(l));
+        if (off.length) items.push(mi(`Delete all of “${a.name}”`, `−${fmt(off.reduce((s, l) => s + saveOf(l), 0))}`, () => setMarks(off, true), { danger: true }));
+      }
+    }
+    items.push(msep(), mi('Copy name', '', () => navigator.clipboard && navigator.clipboard.writeText(n.name).then(() => toast('Copied'))));
+    showMenu(items, x, y);
+  }
+  // A task: clear what tools produced (the usual choice: you keep the
+  // conversation, so Claude still knows what happened), or all of it.
+  function taskItems(n) {
+    const all = deletableLeaves(n), tools = all.filter(isToolOutput);
+    const off = (l) => l.filter(x => !isMarked(x)), tok = (l) => fmt(l.reduce((a, x) => a + saveOf(x), 0));
+    const items = [];
+    if (!all.length) return [mi('Nothing here can be deleted', '', null, { disabled: true, note: firstLock(n) })];
+    if (off(tools).length) items.push(mi('Clear its tool output', `−${tok(off(tools))}`, () => setMarks(off(tools), true), { danger: true, note: 'Files read, commands run, code written. Keeps what you asked and what Claude answered.' }));
+    if (off(all).length) items.push(mi('Delete the whole task', `−${tok(off(all))}`, () => setMarks(off(all), true), { danger: true, note: 'Also your messages and Claude’s replies. Claude forgets this task happened.' }));
+    if (all.some(isMarked)) items.push(mi('Keep all of it', `+${tok(all.filter(isMarked))}`, () => setMarks(all, false)));
+    const stale = off(all).filter(l => l.stale);
+    if (stale.length && stale.length < off(all).length) items.push(mi('Delete only out-of-date copies', `−${tok(stale)}`, () => setMarks(stale, true), { danger: true, note: `${stale.length} item(s) a later turn replaced` }));
+    return items;
+  }
+  // The whole session: clear the tool output of every task but the latest few.
+  function cleanupItems() {
+    const tasks = curRoot().kids.filter(k => isTask(k) && k.id.startsWith('g:task:')).sort((a, b) => (a.ord || 0) - (b.ord || 0));
+    const earlier = curRoot().kids.find(k => k.id === 'g:earlier');
+    const out = [];
+    const chips = [];
+    for (const keep of [1, 2, 3, 5, 10]) {
+      if (keep >= tasks.length) break;
+      const old = [...(earlier ? [earlier] : []), ...tasks.slice(0, tasks.length - keep)];
+      const leaves = old.flatMap(t => deletableLeaves(t)).filter(l => isToolOutput(l) && !isMarked(l));
+      if (!leaves.length) continue;
+      chips.push(h('button', { class: 'chip', title: `Clear the tool output of every task except the latest ${keep}`, onclick: () => { closeMenu(); setMarks(leaves, true); } }, `keep last ${keep} · −${fmt(leaves.reduce((a, l) => a + saveOf(l), 0))}`));
+    }
+    if (chips.length) out.push(mh('Clear tool output of older tasks'), h('div', { class: 'mchips' }, chips));
+    else out.push(mi('Right-click a task to clear it', '', null, { disabled: true }));
+    return out;
+  }
+  const countLeaves = (n) => (n.kids ? n.kids.reduce((a, k) => a + countLeaves(k), 0) : 1);
+  const firstLock = (n) => { if (!n.kids) return n.lock || ''; for (const k of n.kids) { const l = firstLock(k); if (l) return l; } return ''; };
+
+  // -------------------------------------------------------------- treemap
+  // Squarified layout, nested with a label band for each group large enough to
+  // carry one, shaded with van Wijk & van de Wetering cushions.
+  const HEAD = 16, CUSH_H = 0.5, CUSH_F = 0.75;
+  const LX = -0.09759, LY = -0.19518, LZ = 0.9759, IA = 0.22, IS = 0.82;
+  let M = { leaves: [], heads: [], groups: [], w: 0, h: 0 };
+
+  function worst(row, side) {
+    let sum = 0, mx = 0, mn = Infinity;
+    for (const r of row) { sum += r.a; if (r.a > mx) mx = r.a; if (r.a < mn) mn = r.a; }
+    const s2 = side * side, q = sum * sum;
+    return Math.max((s2 * mx) / q, q / (s2 * mn));
+  }
+  function squarify(items, x, y, w, h, out) {
+    const total = items.reduce((a, i) => a + i.v, 0);
+    if (!total || w <= 0 || h <= 0) return;
+    const scale = (w * h) / total;
+    let rest = items.map(i => ({ n: i.n, a: i.v * scale }));
+    while (rest.length) {
+      const side = Math.min(w, h);
+      let row = [], best = Infinity;
+      for (const it of rest) {
+        const cand = row.concat(it);
+        const wr = worst(cand, side);
+        if (row.length && wr > best) break;
+        row = cand; best = wr;
+      }
+      const area = row.reduce((a, r) => a + r.a, 0);
+      if (w >= h) {
+        const cw = area / h; let cy = y;
+        for (const r of row) { const rh = r.a / cw; out.push({ n: r.n, x, y: cy, w: cw, h: rh }); cy += rh; }
+        x += cw; w -= cw;
       } else {
-        treemapTooltip.classList.add('hidden');
+        const rh = area / w; let cx = x;
+        for (const r of row) { const rw = r.a / rh; out.push({ n: r.n, x: cx, y, w: rw, h: rh }); cx += rw; }
+        y += rh; h -= rh;
       }
-    });
+      rest = rest.slice(row.length);
+    }
+  }
+  function ridge(s, x, y, w, h, hh) {
+    const o = s.slice();
+    if (w > 0) { o[0] += (4 * hh * (2 * x + w)) / w; o[2] -= (4 * hh) / w; }
+    if (h > 0) { o[1] += (4 * hh * (2 * y + h)) / h; o[3] -= (4 * hh) / h; }
+    return o;
+  }
+  function layoutNode(n, x, y, w, h, depth, s, out) {
+    if (w < 0.5 || h < 0.5) return;
+    const surf = ridge(s, x, y, w, h, CUSH_H * Math.pow(CUSH_F, depth));
+    if (!n.kids || !n.kids.length) { out.leaves.push({ n, x, y, w, h, s: surf }); return; }
+    out.groups.push({ n, x, y, w, h });
+    let cy = y, ch = h;
+    if (depth > 0 && w >= 46 && h >= HEAD * 2.2) { out.heads.push({ n, x, y, w, h: HEAD }); cy += HEAD; ch -= HEAD; }
+    const items = n.kids.filter(k => k.tok > 0).sort((a, b) => b.tok - a.tok).map(k => ({ n: k, v: k.tok }));
+    const rects = [];
+    // a hairline between siblings of a group keeps structure readable
+    const pad = depth > 0 && w > 8 && h > 8 ? 1 : 0;
+    squarify(items, x + pad, cy + (pad && cy === y ? pad : 0), w - 2 * pad, ch - pad - (pad && cy === y ? pad : 0), rects);
+    for (const r of rects) layoutNode(r.n, r.x, r.y, r.w, r.h, depth + 1, surf, out);
+  }
 
-    treemapCanvas.addEventListener('mouseleave', () => {
-      state.hoveredRect = null;
-      treemapTooltip.classList.add('hidden');
-      renderTreemap();
-    });
+  function layoutMap() {
+    const wrap = $('#map-wrap');
+    const w = wrap.clientWidth, hh = wrap.clientHeight;
+    M = { leaves: [], heads: [], groups: [], w, h: hh };
+    if (!S.mapRoot || w < 10 || hh < 10) return;
+    layoutNode(S.mapRoot, 0, 0, w, hh, 0, [0, 0, 0, 0], M);
+    paintMap();
+    renderOverlay();
+    renderPath();
+  }
 
-    treemapCanvas.addEventListener('click', () => {
-      if (state.hoveredRect) {
-        const r = state.hoveredRect;
-        if (state.contextData && state.contextData.blocks) {
-          const matchBlock = state.contextData.blocks.find(b =>
-            (b.tuid && b.tuid === r.tuid) ||
-            (b.tool === r.tool && b.target === r.target && Math.abs(b.tok - r.tok) < 10)
-          );
-
-          if (matchBlock) {
-            setViewMode('dual');
-            // Expand region if collapsed
-            if (matchBlock.regionId != null) {
-              state.collapsedRegions.delete(matchBlock.regionId);
-              renderNarrativeStream();
-            }
-
-            setTimeout(() => {
-              const card = document.getElementById(`card-${matchBlock.id}`);
-              if (card) {
-                card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                card.classList.add('highlight-flash');
-                setTimeout(() => card.classList.remove('highlight-flash'), 1800);
-              }
-            }, 100);
-            return;
-          }
+  function paintMap() {
+    const c = $('#map'), dpr = Math.min(2, window.devicePixelRatio || 1);
+    const W = Math.round(M.w * dpr), H = Math.round(M.h * dpr);
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+    if (!W || !H) return;
+    const img = ctx.createImageData(W, H), d = img.data;
+    const bg = rgb(getComputedStyle(document.documentElement).getPropertyValue('--map-bg').trim() || '#0b0d10');
+    for (let i = 0; i < d.length; i += 4) { d[i] = bg[0]; d[i + 1] = bg[1]; d[i + 2] = bg[2]; d[i + 3] = 255; }
+    const grey = S.mapRoot && S.mapRoot.id === 'grey';
+    for (const L of M.leaves) {
+      let [r, g, b] = rgb(colorOf(L.n.t));
+      if (grey) { const y = 0.3 * r + 0.59 * g + 0.11 * b; r = g = b = y * 0.75; }
+      const x0 = Math.max(0, Math.round(L.x * dpr)), x1 = Math.min(W, Math.round((L.x + L.w) * dpr));
+      const y0 = Math.max(0, Math.round(L.y * dpr)), y1 = Math.min(H, Math.round((L.y + L.h) * dpr));
+      const s = L.s;
+      for (let py = y0; py < y1; py++) {
+        const yy = (py + 0.5) / dpr;
+        const ny = -(2 * s[3] * yy + s[1]);
+        let i = (py * W + x0) * 4;
+        for (let px = x0; px < x1; px++, i += 4) {
+          const xx = (px + 0.5) / dpr;
+          const nx = -(2 * s[2] * xx + s[0]);
+          const cos = (nx * LX + ny * LY + LZ) / Math.sqrt(nx * nx + ny * ny + 1);
+          const I = IA + (cos > 0 ? IS * cos : 0);
+          d[i] = r * I > 255 ? 255 : r * I; d[i + 1] = g * I > 255 ? 255 : g * I; d[i + 2] = b * I > 255 ? 255 : b * I;
         }
-
-        const zoomLabel = r.tool ? `tool:${r.tool}` : (r.sub || r.cat || r.kind);
-        state.zoomStack.push(zoomLabel);
-        renderBreadcrumb();
-        renderTreemap();
       }
+    }
+    ctx.putImageData(img, 0, 0);
+    ctx.scale(dpr, dpr);
+    // group label bands, WizTree style: "Tool results (135.9k)"
+    const css = getComputedStyle(document.documentElement);
+    ctx.font = `500 11px ${css.getPropertyValue('--font')}`;
+    ctx.textBaseline = 'middle';
+    for (const hd of M.heads) {
+      ctx.fillStyle = css.getPropertyValue('--map-head').trim() || 'rgba(11,13,16,.86)';
+      ctx.fillRect(hd.x, hd.y, hd.w, hd.h);
+      ctx.fillStyle = css.getPropertyValue('--map-head-text').trim() || '#c9ced6';
+      clipText(ctx, `${hd.n.name}  ${fmt(hd.n.tok)}`, hd.x + 5, hd.y + hd.h / 2 + 0.5, hd.w - 10);
+    }
+    // leaf labels where they fit
+    ctx.font = `11px ${css.getPropertyValue('--font')}`;
+    for (const L of M.leaves) {
+      if (L.w < 64 || L.h < 22) continue;
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      clipText(ctx, L.n.name, L.x + 6, L.y + 11.5, L.w - 12);
+      ctx.fillStyle = 'rgba(255,255,255,.92)';
+      clipText(ctx, L.n.name, L.x + 5, L.y + 11, L.w - 12);
+      if (L.h >= 36) {
+        ctx.fillStyle = 'rgba(255,255,255,.7)';
+        clipText(ctx, fmt(L.n.tok), L.x + 5, L.y + 25, L.w - 12);
+      }
+    }
+  }
+  function clipText(ctx, text, x, y, max) {
+    if (max < 12) return;
+    if (ctx.measureText(text).width <= max) { ctx.fillText(text, x, y); return; }
+    let lo = 0, hi = text.length;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(`${text.slice(0, mid)}…`).width <= max) lo = mid; else hi = mid - 1; }
+    if (lo > 0) ctx.fillText(`${text.slice(0, lo)}…`, x, y);
+  }
+
+  let hatch = null;
+  function hatchPattern(ctx) {
+    if (hatch) return hatch;
+    const p = document.createElement('canvas');
+    p.width = p.height = 8;
+    const g = p.getContext('2d');
+    g.fillStyle = 'rgba(8,9,12,.62)'; g.fillRect(0, 0, 8, 8);
+    g.strokeStyle = 'rgba(255,111,97,.75)'; g.lineWidth = 1.4;
+    g.beginPath(); g.moveTo(-2, 10); g.lineTo(10, -2); g.moveTo(-2, 2); g.lineTo(2, -2); g.moveTo(6, 10); g.lineTo(10, 6); g.stroke();
+    hatch = ctx.createPattern(p, 'repeat');
+    return hatch;
+  }
+  function renderOverlay() {
+    const c = $('#map-over'), dpr = Math.min(2, window.devicePixelRatio || 1);
+    const W = Math.round(M.w * dpr), H = Math.round(M.h * dpr);
+    if (c.width !== W || c.height !== H) { c.width = W; c.height = H; hatch = null; }
+    const ctx = c.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.scale(dpr, dpr);
+    const grey = S.mapRoot && S.mapRoot.id === 'grey';
+    if (S.typeHi) {
+      ctx.fillStyle = 'rgba(8,9,12,.74)';
+      for (const L of M.leaves) if (L.n.t !== S.typeHi) ctx.fillRect(L.x, L.y, L.w, L.h);
+    }
+    if (!grey && S.marks.size) {
+      ctx.fillStyle = hatchPattern(ctx);
+      for (const L of M.leaves) if (markedSave(L.n) || isMarked(L.n)) ctx.fillRect(L.x, L.y, L.w, L.h);
+    }
+    if (grey) {
+      // a group whose op is on gets the same hatch
+      for (const g of M.groups) if (g.n.ops && opsOn(g.n)) { ctx.fillStyle = hatchPattern(ctx); ctx.fillRect(g.x, g.y, g.w, g.h); }
+    }
+    const sel = S.byId.get(S.sel);
+    if (sel && rootOf(sel) === S.mapRoot) {
+      const r = sel.kids ? M.groups.find(g => g.n === sel) : M.leaves.find(l => l.n === sel);
+      if (r && sel !== S.mapRoot) {
+        ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 4;
+        ctx.strokeRect(r.x + 1, r.y + 1, Math.max(0, r.w - 2), Math.max(0, r.h - 2));
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+        ctx.strokeRect(r.x + 1, r.y + 1, Math.max(0, r.w - 2), Math.max(0, r.h - 2));
+      }
+    }
+    if (S.hover && S.hover.n !== sel) {
+      const r = S.hover;
+      ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 1;
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, Math.max(0, r.w - 1), Math.max(0, r.h - 1));
+    }
+  }
+  function hit(x, y) {
+    for (const hd of M.heads) if (x >= hd.x && x < hd.x + hd.w && y >= hd.y && y < hd.y + hd.h) return { ...M.groups.find(g => g.n === hd.n), head: true };
+    for (const L of M.leaves) if (x >= L.x && x < L.x + L.w && y >= L.y && y < L.y + L.h) return L;
+    return null;
+  }
+  function mapEvents() {
+    const c = $('#map-over'), tip = $('#tip'), wrap = $('#map-wrap');
+    const pos = (e) => { const r = c.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    c.addEventListener('mousemove', (e) => {
+      const [x, y] = pos(e);
+      const r = hit(x, y);
+      if (!r) { tip.classList.add('hidden'); if (S.hover) { S.hover = null; renderOverlay(); } return; }
+      if (!S.hover || S.hover.n !== r.n) { S.hover = r; renderOverlay(); fillTip(r.n); }
+      tip.classList.remove('hidden');
+      const tw = tip.offsetWidth, th = tip.offsetHeight;
+      let tx = x + 14, ty = y + 16;
+      if (tx + tw > wrap.clientWidth) tx = x - tw - 10;
+      if (ty + th > wrap.clientHeight) ty = y - th - 10;
+      tip.style.left = `${Math.max(0, tx)}px`; tip.style.top = `${Math.max(0, ty)}px`;
+    });
+    c.addEventListener('mouseleave', () => { tip.classList.add('hidden'); S.hover = null; renderOverlay(); });
+    c.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      const [x, y] = pos(e);
+      const r = hit(x, y);
+      if (r) select(r.n.id, { fromMap: true });
+    });
+    c.addEventListener('dblclick', (e) => {
+      const [x, y] = pos(e);
+      const r = hit(x, y);
+      if (r) { const p = r.n.kids ? r.n : S.parent.get(r.n.id); if (p) { S.open.add(p.id); select(r.n.id); } }
+    });
+    c.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const [x, y] = pos(e);
+      const r = hit(x, y);
+      tip.classList.add('hidden');
+      if (!r) return;
+      select(r.n.id, { fromMap: true });
+      openMenu(r.n, e.clientX, e.clientY);
+    });
+  }
+  function fillTip(n) {
+    const tip = $('#tip');
+    const path = ancestors(n).reverse().slice(1).map(a => a.name).join(' › ');
+    const kids = [];
+    if (path) kids.push(h('div', { class: 't-path', text: path }));
+    kids.push(h('div', { class: 't-name', text: n.name }));
+    const p = S.parent.get(n.id);
+    kids.push(h('div', { class: 't-row' }, h('span', null, h('b', { text: fmt(n.tok) }), ' tokens'),
+      p ? h('span', { text: `${pct(n.tok, p.tok)} of ${p.name}` }) : null,
+      n.turn ? h('span', { text: `turn ${n.turn}` }) : null));
+    if (n.kids) kids.push(h('div', { class: 't-row', text: `${n.n.toLocaleString()} items` }));
+    if (isTask(n) && n.ts) kids.push(h('div', { class: 't-row', text: taskSub(n) }));
+    if (isMarked(n)) kids.push(h('div', { class: 't-mark', text: isShrink(n) ? 'Marked to shrink' : 'Marked for deletion' }));
+    else if (!n.kids && !canDelete(n)) kids.push(h('div', { class: 't-lock', text: n.lock || '' }));
+    else if (n.stale) kids.push(h('div', { class: 't-lock', text: n.stale }));
+    tip.replaceChildren(...kids);
+  }
+  function renderPath() {
+    const el = $('#map-path');
+    const n = S.byId.get(S.sel) || S.mapRoot;
+    if (!n) { el.replaceChildren(); return; }
+    const chain = [...ancestors(n).reverse(), n];
+    const parts = [];
+    chain.forEach((a, i) => {
+      if (i) parts.push(h('span', { class: 'sep', text: '›' }));
+      parts.push(h('span', { class: i === chain.length - 1 ? '' : 'crumb', text: a.name, onclick: i === chain.length - 1 ? null : () => select(a.id) }));
+    });
+    el.replaceChildren(...parts);
+  }
+
+  // --------------------------------------------------------------- status
+  function renderStatus() {
+    const n = S.byId.get(S.sel);
+    const sel = $('#status-sel');
+    if (n) {
+      sel.replaceChildren(h('b', { text: n.name }), `  ${fmt(n.tok)} tokens`, n.kids ? ` · ${n.n.toLocaleString()} items` : '');
+    } else sel.textContent = '';
+    const cut = S.map ? curRoot()._mt || 0 : 0;
+    const count = S.map ? curRoot()._mk || 0 : 0, ops = opCount();
+    const parts = [];
+    if (count) parts.push(`${count.toLocaleString()} marked · −${fmt(cut)} tokens`);
+    if (ops) parts.push(`${ops} file change${ops > 1 ? 's' : ''}`);
+    $('#status-marked').textContent = parts.join(' · ');
+    $('#btn-review').disabled = !(count || ops);
+    $('#btn-undo').disabled = !S.undo.length;
+  }
+
+  // -------------------------------------------------------------- details
+  let detailsReq = 0;
+  function renderDetails() {
+    const el = $('#details');
+    const n = S.byId.get(S.sel);
+    if (!n || !S.map) { el.replaceChildren(h('div', { class: 'empty', text: 'Select anything to see what it is.' })); return; }
+    const kids = [];
+    const p = S.parent.get(n.id);
+    const kicker = isTask(n) ? [n.id === 'g:earlier' ? 'Earlier' : 'Task', n.from != null ? `turns ${n.from}–${n.turn}` : '', n.ts ? ago(n.ts) : ''].filter(Boolean).join(' · ')
+      : (n.kids ? (p ? 'Group' : '') : typeLabel(n.t));
+    kids.push(h('div', { class: 'd-kicker' }, p && !isTask(n) ? h('span', { class: 'sw', style: `background:${colorOf(n.t)}` }) : null, h('span', { text: kicker })));
+    kids.push(h('div', { class: 'd-title', text: n.name }));
+    const stats = [h('div', { class: 'd-stat' }, h('b', { text: fmt(n.tok) }), h('span', { text: 'tokens' }))];
+    if (p) stats.push(h('div', { class: 'd-stat' }, h('b', { text: pct(n.tok, p.tok) }), h('span', { text: `of ${p.name}` })));
+    if (n.kids) stats.push(h('div', { class: 'd-stat' }, h('b', { text: n.n.toLocaleString() }), h('span', { text: 'items' })));
+    if (n.turn) stats.push(h('div', { class: 'd-stat' }, h('b', { text: String(n.turn) }), h('span', { text: n.kids ? 'last turn' : 'turn' })));
+    if (n._mt) stats.push(h('div', { class: 'd-stat' }, h('b', { style: 'color:var(--danger)', text: `−${fmt(n._mt)}` }), h('span', { text: 'marked' })));
+    kids.push(h('div', { class: 'd-stats' }, stats));
+    if (n.id === 'root' && S.map) kids.push(h('p', { class: 'd-note', text: `What claude --resume sends for this session: ${pct(n.tok, S.map.window)} of a ${fmt(S.map.window)} window.${S.map.measured ? ` Claude Code last measured ${fmt(S.map.measured)}.` : ''}` }));
+    if (isTask(n)) kids.push(...taskDetails(n));
+    if (n.stale) kids.push(h('p', { class: 'd-warn', text: n.stale }));
+    if (n.info) kids.push(h('p', { class: 'd-note', text: n.info }));
+    if (n.warn) kids.push(h('p', { class: 'd-warn', text: n.warn }));
+    if (n.profile) kids.push(h('p', { class: 'd-note', text: 'Needs a launch profile; ctxtree writes it and the resume command uses it.' }));
+    if (!n.kids && !canDelete(n)) kids.push(h('p', { class: 'd-lock' }, svg(ICON.lock, 'lockic'), h('span', { text: n.lock || '' })));
+
+    const acts = h('div', { class: 'd-actions' });
+    if (isGrey(n)) {
+      const g = n.ops ? n : ancestors(n).find(a => a.ops);
+      if (g) for (const o of g.ops) {
+        const on = o.op === 'switch' ? S.ops.switchTip === o.tip : S.ops[o.op];
+        acts.append(h('button', { class: on ? 'primary' : 'secondary', title: o.note, text: on ? `✓ ${o.label}` : o.label, onclick: () => setOp(o.op, on ? false : (o.op === 'switch' ? o.tip : true)) }));
+      }
+    } else if (isTask(n)) {
+      const all = deletableLeaves(n), tools = all.filter(isToolOutput);
+      const toolsOn = tools.length && tools.every(isMarked), allOn = all.length && all.every(isMarked);
+      const tok = (l) => fmt(l.reduce((a, x) => a + saveOf(x), 0));
+      if (tools.length) acts.append(h('button', { class: toolsOn ? 'secondary' : 'primary danger', title: 'Files read, commands run, code written. Keeps what you asked and what Claude answered.',
+        text: toolsOn ? 'Keep tool output' : `Clear tool output  −${tok(tools)}`, onclick: () => setMarks(tools, !toolsOn) }));
+      if (all.length > tools.length) acts.append(h('button', { class: 'secondary', title: 'Also your messages and Claude’s replies',
+        text: allOn ? 'Keep everything' : `Delete whole task  −${tok(all)}`, onclick: () => setMarks(all, !allOn) }));
+    } else if (S.parent.get(n.id)) {
+      const leaves = deletableLeaves(n);
+      if (leaves.length) {
+        const all = leaves.every(isMarked);
+        const verb = !n.kids && isShrink(n) ? 'Shrink' : 'Delete';
+        acts.append(h('button', { class: all ? 'secondary' : 'primary danger', text: all ? 'Keep' : (n.kids ? `${verb} ${leaves.length > 1 ? `all ${leaves.length}` : ''}`.trim() : verb), onclick: () => setMarks(leaves, !all) }));
+      }
+    }
+    if (acts.childNodes.length) kids.push(acts);
+
+    // what it actually says: a task item shows the call, then what came back
+    const ids = n.kids ? [] : (n.blocks || [(actsOf(n)[0] && actsOf(n)[0].k === 'block' && actsOf(n)[0].id) || (/^(b_|l_|d:)/.test(n.id) ? n.id : null)].filter(Boolean));
+    const req = ++detailsReq;
+    ids.forEach((id, i) => {
+      if (ids.length > 1) kids.push(h('div', { class: 'label', style: 'margin:8px 0 4px', text: i === 0 ? 'Claude sent' : 'It got back' }));
+      const pre = h('pre', { class: 'd-pre', text: 'Loading…' });
+      kids.push(pre);
+      api(`/api/block?sid=${encodeURIComponent(S.sid)}&id=${encodeURIComponent(id)}`).then(b => {
+        if (req !== detailsReq) return;
+        pre.textContent = b.text || '(empty)';
+        if (b.truncated) pre.after(h('div', { class: 'd-more', text: `Showing the first 6,000 of ${b.chars.toLocaleString()} characters.` }));
+      }).catch(e => { if (req === detailsReq) pre.textContent = e.message; });
+    });
+    el.replaceChildren(...kids);
+  }
+
+  // A task, explained: what you asked, how it ended, what it touched, and
+  // whether anything since still leans on it.
+  function taskDetails(n) {
+    const out = [];
+    if (n.ask) out.push(h('div', { class: 'label', text: 'You asked' }), h('blockquote', { class: 'd-quote', text: tidyText(n.ask, 420) }));
+    if (n.outcome) out.push(h('div', { class: 'label', text: 'Claude’s last reply in this task' }), h('blockquote', { class: 'd-quote', text: tidyText(n.outcome, 420) }));
+    if (n.files && n.files.length) out.push(h('div', { class: 'label', text: 'Files it touched' }),
+      h('div', { class: 'd-files' }, n.files.map(f => h('span', { class: 'file', title: f, text: f.split('/').pop() }))));
+    const signals = [];
+    const stale = deletableLeaves(n).filter(l => l.stale);
+    if (n.latest) signals.push(['ok', 'This is the task you’re on now.']);
+    else if (n.lastRef) signals.push(['', `Its files came up again at turn ${n.lastRef}, so later work may lean on it.`]);
+    else if (n.ownFiles) signals.push(['old', 'Nothing since has mentioned the files it worked on.']);
+    if (stale.length) signals.push(['old', `${stale.length} item${stale.length > 1 ? 's are' : ' is'} out of date (re-read, re-run or changed later): −${fmt(stale.reduce((a, l) => a + saveOf(l), 0))} at no cost.`]);
+    if (signals.length) out.push(h('ul', { class: 'd-signals' }, signals.map(([c, t]) => h('li', { class: c, text: t }))));
+    return out;
+  }
+  const tidyText = (t, n) => { const s = String(t || '').replace(/<\/?[a-z][\w-]*[^>]*>/gi, ' ').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n)}…` : s; };
+
+  // --------------------------------------------------------------- review
+  let drawerMode = '', verifyReq = 0;
+  function payload() {
+    const edits = [], boot = [];
+    for (const key of S.marks) {
+      const a = S.actByKey.get(key);
+      if (!a) continue;
+      if (a.k === 'block') edits.push({ id: a.id, fp: a.fp, op: a.op || 'tombstone' });
+      else if (a.k === 'boot') boot.push(a.id);
+    }
+    const structure = [];
+    if (S.ops.switchTip) structure.push({ op: 'switch', tip: S.ops.switchTip });
+    if (S.ops.uncompact) structure.push({ op: 'uncompact' });
+    if (S.ops.slim) structure.push({ op: 'slim' });
+    return { sid: S.sid, edits, boot, structure };
+  }
+  function openDrawer(mode) {
+    drawerMode = mode;
+    $('#drawer').classList.remove('hidden');
+    $('#scrim').classList.remove('hidden');
+  }
+  function closeDrawer() {
+    drawerMode = '';
+    $('#drawer').classList.add('hidden');
+    $('#scrim').classList.add('hidden');
+  }
+
+  function openReview() {
+    if (!S.marks.size && !opCount()) return;
+    openDrawer('review');
+    renderReview();
+    verify();
+  }
+  let lastVerify = null;
+  async function verify() {
+    const req = ++verifyReq;
+    lastVerify = { state: 'run' };
+    paintVerify();
+    try {
+      const r = await api('/api/fork', { ...payload(), dryRun: true });
+      if (req !== verifyReq) return;
+      lastVerify = { state: 'ok', r };
+    } catch (e) {
+      if (req !== verifyReq) return;
+      lastVerify = { state: 'bad', msg: e.message, problems: (e.data && e.data.problems) || [] };
+    }
+    paintVerify();
+  }
+  function paintVerify() {
+    const el = document.getElementById('verify');
+    if (!el || !lastVerify) return;
+    const v = lastVerify;
+    el.className = `verify ${v.state}`;
+    const dot = h('span', { class: 'dot' });
+    if (v.state === 'run') el.replaceChildren(dot, h('span', { text: 'Building the fork and checking it (nothing is written yet)…' }));
+    else if (v.state === 'ok') {
+      const { saved } = v.r.resume;
+      el.replaceChildren(dot, h('span', { text: `Verified on a full build of the fork: every tool call still pairs with its result, the resumed chain is intact, and ${fmt(saved)} tokens come off.${v.r.bytes ? ` File ${fmtBytes(v.r.bytes.before)} → ${fmtBytes(v.r.bytes.after)}.` : ''}` }));
+      const btn = document.getElementById('btn-commit');
+      if (btn) btn.disabled = false;
+    } else {
+      el.replaceChildren(dot, h('div', null, h('div', { text: v.msg }), v.problems.length ? h('ul', null, v.problems.slice(0, 6).map(p => h('li', { text: p.error }))) : null));
+    }
+  }
+  const fmtBytes = (b) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`);
+
+  function renderReview() {
+    const dr = $('#drawer');
+    const m = S.map;
+    const now = curRoot().tok, cut = curRoot()._mt || 0, after = now - cut;
+    const groups = new Map(), marked = [];
+    const each = (n) => { if (n.kids) return n.kids.forEach(each); if (markedSave(n) || isMarked(n)) marked.push(n); };
+    each(curRoot());
+    for (const n of marked) {
+      const top = ancestors(n).reverse()[1] || n;
+      const g = groups.get(top.id) || { name: top.name, items: [], tok: 0 };
+      g.items.push(n); g.tok += markedSave(n);
+      groups.set(top.id, g);
+    }
+    const body = h('div', { class: 'dr-body' });
+    body.append(h('div', { class: 'sum' },
+      h('div', { class: 'sum-nums' }, h('span', { class: 'from', text: fmt(now) }), h('span', { class: 'arrow', text: '→' }), h('span', { class: 'to', text: `${fmt(after)} tokens` }),
+        h('span', { class: 'saved', text: cut ? `−${fmt(cut)}` : '' })),
+      h('div', { class: 'meter-bar' }, h('span', { class: 'keep', style: `width:${(100 * after) / m.window}%` }), h('span', { class: 'cut', style: `width:${(100 * cut) / m.window}%` })),
+      h('div', { id: 'verify', class: 'verify' })));
+
+    const warns = new Set(), profile = [];
+    for (const n of marked) { if (n.warn && n.t !== 'prompt' && n.t !== 'reply') warns.add(n.warn); if (n.profile) profile.push(n); }
+    const conv = marked.filter(n => n.t === 'prompt' || n.t === 'reply');
+    if (conv.length) warns.add(`${conv.length} message${conv.length > 1 ? 's' : ''} from the conversation itself will be replaced by a note. Claude loses what ${conv.length > 1 ? 'they' : 'it'} said.`);
+    if (warns.size) body.append(h('div', { class: 'callout warn' }, h('b', { text: 'Check before you go' }), h('ul', null, [...warns].slice(0, 6).map(w => h('li', { text: w })))));
+    if (profile.length) body.append(h('div', { class: 'callout' }, h('b', { text: 'Resume with the command ctxtree gives you. ' }),
+      `${profile.length} setup removal${profile.length > 1 ? 's need' : ' needs'} a launch profile (a small settings file) so Claude Code doesn’t load ${profile.length > 1 ? 'them' : 'it'} again. Plain claude --resume would bring ${profile.length > 1 ? 'them' : 'it'} back.`));
+
+    for (const g of [...groups.values()].sort((a, b) => b.tok - a.tok)) {
+      const sec = h('div', { class: 'sec' }, h('h3', null, h('span', { class: 'nm', text: g.name, title: g.name }), h('span', { text: `${g.items.length} · −${fmt(g.tok)}` })));
+      const items = g.items.sort((a, b) => markedSave(b) - markedSave(a));
+      for (const n of items.slice(0, 40)) {
+        sec.append(h('div', { class: 'qrow' }, h('span', { class: 'sw', style: `background:${colorOf(n.t)}` }),
+          h('span', { class: 'nm', text: n.name, title: ancestors(n).reverse().slice(1).map(a => a.name).concat(n.name).join(' › ') }),
+          h('span', { class: 't', text: `${isShrink(n) ? 'shrink ' : ''}−${fmt(markedSave(n))}` }),
+          h('button', { class: 'x', title: 'Keep this', text: '×', onclick: () => { setMarks([n], false); if (!S.marks.size && !opCount()) closeDrawer(); else verify(); } })));
+      }
+      if (items.length > 40) sec.append(h('div', { class: 'qmore', text: `and ${items.length - 40} more` }));
+      body.append(sec);
+    }
+    const ops = [];
+    if (S.ops.switchTip) ops.push(['Switch to the rewound branch', 'switch', false]);
+    if (S.ops.uncompact) ops.push(['Restore the conversation before the compaction', 'uncompact', false]);
+    if (S.ops.slim) ops.push(['Remove everything not resumed from the fork’s file', 'slim', false]);
+    if (ops.length) {
+      const sec = h('div', { class: 'sec' }, h('h3', null, 'File changes', h('span', { text: '' })));
+      for (const [label, op] of ops) sec.append(h('div', { class: 'qrow' }, h('span', { class: 'sw', style: 'background:var(--faint)' }), h('span', { class: 'nm', text: label }),
+        h('button', { class: 'x', title: 'Undo this', text: '×', onclick: () => { setOp(op, false); if (!S.marks.size && !opCount()) closeDrawer(); else verify(); } })));
+      body.append(sec);
+    }
+
+    const note = h('input', { id: 'fork-note', type: 'text', placeholder: 'Note for this fork (optional)', value: (document.getElementById('fork-note') || {}).value || '' });
+    const commit = h('button', { id: 'btn-commit', class: 'primary danger', disabled: !(lastVerify && lastVerify.state === 'ok'), text: 'Create fork', onclick: commitFork });
+    dr.replaceChildren(
+      h('div', { class: 'dr-head' }, h('h2', { text: 'Delete from context' }), h('p', { text: `${$('#session-title').textContent}` }),
+        h('button', { class: 'dr-x', text: '×', title: 'Close', onclick: closeDrawer })),
+      body,
+      h('div', { class: 'dr-foot' },
+        h('div', { class: 'label', text: 'ctxtree writes a new session (a fork) without these. Your original session is not changed.' }),
+        note,
+        h('div', { class: 'dr-btns' }, h('button', { class: 'secondary', text: 'Cancel', onclick: closeDrawer }), commit)));
+    paintVerify();
+  }
+
+  async function commitFork() {
+    const btn = $('#btn-commit');
+    btn.disabled = true; btn.textContent = 'Creating…';
+    let r;
+    try { r = await api('/api/fork', { ...payload(), note: ($('#fork-note') || {}).value || '' }); } catch (e) {
+      lastVerify = { state: 'bad', msg: e.message, problems: (e.data && e.data.problems) || [] };
+      paintVerify(); btn.textContent = 'Create fork';
+      return;
+    }
+    r.shown = { before: curRoot().tok, after: Math.max(0, curRoot().tok - r.resume.saved) };
+    S.marks.clear(); S.ops = { uncompact: false, slim: false, switchTip: '' }; S.undo = [];
+    await loadSessions().catch(() => {});
+    renderDone(r);
+    changed();
+  }
+  function renderDone(r) {
+    drawerMode = 'done';
+    const dr = $('#drawer');
+    const id8 = r.forkSid.slice(0, 8);
+    const cmd = r.resumeCmd;
+    const short = `ctxtree resume ${id8}`;
+    const copy = (text) => () => navigator.clipboard.writeText(text).then(() => toast('Copied'));
+    dr.replaceChildren(
+      h('div', { class: 'dr-head' }, h('h2', { text: 'Fork created' }), h('p', { text: `${r.projectName} · ${id8}` }),
+        h('button', { class: 'dr-x', text: '×', onclick: closeDrawer })),
+      h('div', { class: 'dr-body' },
+        h('div', { class: 'done-mark' }, svg(ICON.check)),
+        h('div', { class: 'sum-nums' }, h('span', { class: 'from', text: fmt(r.shown.before) }), h('span', { class: 'arrow', text: '→' }),
+          h('span', { class: 'to', text: `${fmt(r.shown.after)} tokens` }), h('span', { class: 'saved', text: `−${fmt(r.resume.saved)}` })),
+        h('p', { class: 'd-note', text: 'The original session is untouched. Continue in the fork:' }),
+        h('div', { class: 'label', text: 'Resume command' }),
+        h('div', { class: 'cmd' }, h('code', { text: cmd }), h('button', { class: 'secondary', text: 'Copy', onclick: copy(cmd) })),
+        h('div', { class: 'label', text: 'or, from anywhere' }),
+        h('div', { class: 'cmd' }, h('code', { text: short }), h('button', { class: 'secondary', text: 'Copy', onclick: copy(short) })),
+        r.profileFile ? h('p', { class: 'd-note', text: 'This fork has a launch profile, so use one of these commands rather than a plain claude --resume.' }) : null),
+      h('div', { class: 'dr-foot' }, h('div', { class: 'dr-btns' },
+        h('button', { class: 'secondary', text: 'Done', onclick: closeDrawer }),
+        h('button', { class: 'primary', text: 'Open the fork here', onclick: () => { closeDrawer(); openSession(r.forkSid); } }))));
+  }
+
+  // ---------------------------------------------------------------- forks
+  async function openForks() {
+    await loadSessions().catch(() => {});
+    openDrawer('forks');
+    renderForks();
+  }
+  function renderForks() {
+    const dr = $('#drawer');
+    const list = [...S.forks].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const body = h('div', { class: 'dr-body' });
+    if (!list.length) body.append(h('p', { class: 'd-note', text: 'No forks yet. Mark something, review it, and create one.' }));
+    for (const f of list) {
+      const copy = () => navigator.clipboard.writeText(f.resumeCmd).then(() => toast('Resume command copied'));
+      body.append(h('div', { class: 'frow' },
+        h('div', { class: 'f-top' }, h('span', { class: 'f-note', text: f.note || 'Fork' }), h('span', { class: 'f-saved', text: f.savedTok ? `−${fmt(f.savedTok)}` : '' })),
+        h('div', { class: 'f-meta', text: `${f.projectName || ''} · ${ago(f.createdAt)} · ${f.forkSid.slice(0, 8)}${f.exists === false ? ' · file missing' : ''}${f.grown ? ' · continued since' : ''}` }),
+        h('div', { class: 'f-btns' },
+          f.exists !== false ? h('button', { text: 'Open', onclick: () => { closeDrawer(); openSession(f.forkSid); } }) : null,
+          h('button', { text: 'Copy resume command', onclick: copy }),
+          h('button', { class: 'del', text: 'Revert', title: 'Delete this fork (the original stays)', onclick: () => revert(f) }))));
+    }
+    dr.replaceChildren(
+      h('div', { class: 'dr-head' }, h('h2', { text: 'Forks' }), h('p', { text: 'Sessions ctxtree wrote. Reverting deletes the fork; the original is never touched.' }),
+        h('button', { class: 'dr-x', text: '×', onclick: closeDrawer })),
+      body);
+  }
+  async function revert(f) {
+    if (!confirm(`Delete fork ${f.forkSid.slice(0, 8)}? The original session stays as it is.`)) return;
+    try { await api('/api/revert', { forkSid: f.forkSid }); } catch (e) {
+      if (!/force/.test(e.message) || !confirm(`${e.message}\n\nDelete it anyway?`)) { toast(e.message, true); return; }
+      try { await api('/api/revert', { forkSid: f.forkSid, force: true }); } catch (e2) { toast(e2.message, true); return; }
+    }
+    toast('Fork deleted');
+    await loadSessions().catch(() => {});
+    if (S.sid === f.forkSid) { const parent = S.sessions.find(s => s.sid === f.parentSid) || S.sessions[0]; if (parent) openSession(parent.sid, { keepMarks: true }); }
+    renderForks();
+  }
+
+  // -------------------------------------------------------- session picker
+  let popKb = 0, popRows = [];
+  function openPicker() {
+    const pop = $('#session-pop'), btn = $('#session-btn').getBoundingClientRect();
+    pop.style.left = `${btn.left}px`; pop.style.top = `${btn.bottom + 6}px`;
+    pop.classList.remove('hidden');
+    const q = $('#session-search');
+    q.value = '';
+    renderPicker();
+    q.focus();
+  }
+  function closePicker() { $('#session-pop').classList.add('hidden'); }
+  function renderPicker() {
+    const q = $('#session-search').value.trim().toLowerCase();
+    popRows = S.sessions.filter(s => !q || `${titleOf(s)} ${s.projectName} ${s.sid}`.toLowerCase().includes(q)).slice(0, 200);
+    popKb = Math.max(0, popRows.findIndex(s => s.sid === S.sid));
+    if (q) popKb = 0;
+    const list = $('#session-list');
+    if (!popRows.length) { list.replaceChildren(h('div', { class: 'none', text: 'No session matches.' })); return; }
+    list.replaceChildren(...popRows.map((s, i) => h('div', { class: `srow${s.sid === S.sid ? ' cur' : ''}${i === popKb ? ' kb' : ''}`, 'data-sid': s.sid, role: 'option' },
+      h('div', { class: 's-main' }, h('div', { class: 's-t' }, titleOf(s) || s.sid.slice(0, 8), forkOf(s.sid) ? h('span', { class: 'tag', text: 'fork' }) : null),
+        h('div', { class: 's-m', text: `${s.projectName} · ${ago(s.lastTs)} · ${s.turns} turns` })),
+      h('div', { class: 's-tok', text: fmt(s.peak || s.tok) }))));
+    const kb = list.querySelector('.kb');
+    if (kb) kb.scrollIntoView({ block: 'nearest' });
+  }
+  function pickerEvents() {
+    $('#session-btn').addEventListener('click', (e) => { e.stopPropagation(); if ($('#session-pop').classList.contains('hidden')) openPicker(); else closePicker(); });
+    $('#session-search').addEventListener('input', renderPicker);
+    $('#session-search').addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        popKb = Math.max(0, Math.min(popRows.length - 1, popKb + (e.key === 'ArrowDown' ? 1 : -1)));
+        document.querySelectorAll('.srow').forEach((r, i) => r.classList.toggle('kb', i === popKb));
+        const kb = document.querySelector('.srow.kb'); if (kb) kb.scrollIntoView({ block: 'nearest' });
+        e.preventDefault();
+      } else if (e.key === 'Enter' && popRows[popKb]) { closePicker(); openSession(popRows[popKb].sid); }
+      else if (e.key === 'Escape') closePicker();
+    });
+    $('#session-list').addEventListener('click', (e) => {
+      const r = e.target.closest('.srow');
+      if (r) { closePicker(); openSession(r.dataset.sid); }
     });
   }
 
-  // Initialize on DOM Ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
+  // ------------------------------------------------------------ splitters
+  function splitters() {
+    const upper = $('#upper'), side = $('#side-pane');
+    const hFrac = store.get('splitH', 0.52), vFrac = store.get('splitV', 0.36);
+    upper.style.flexBasis = `${hFrac * 100}%`;
+    side.style.flexBasis = `${vFrac * 100}%`;
+    const drag = (el, onMove, onEnd) => el.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      el.classList.add('drag');
+      const move = (ev) => onMove(ev);
+      const up = () => { el.classList.remove('drag'); removeEventListener('mousemove', move); removeEventListener('mouseup', up); onEnd(); };
+      addEventListener('mousemove', move); addEventListener('mouseup', up);
+    });
+    drag($('#split-h'), (e) => {
+      const r = $('#main').getBoundingClientRect();
+      const f = Math.max(0.2, Math.min(0.8, (e.clientY - r.top) / r.height));
+      upper.style.flexBasis = `${f * 100}%`;
+      store.set('splitH', f);
+      renderTree();
+    }, () => layoutMap());
+    drag($('#split-v'), (e) => {
+      const r = upper.getBoundingClientRect();
+      const f = Math.max(0.22, Math.min(0.6, (r.right - e.clientX) / r.width));
+      side.style.flexBasis = `${f * 100}%`;
+      store.set('splitV', f);
+    }, () => {});
   }
+
+  // ----------------------------------------------------------------- boot
+  async function rescan() {
+    const b = $('#btn-rescan');
+    b.classList.add('spin');
+    try {
+      await api('/api/refresh', {});
+      await loadSessions();
+      if (S.sid) await openSession(S.sid, { keepMarks: true });
+      toast('Rescanned');
+    } catch (e) { toast(e.message, true); }
+    b.classList.remove('spin');
+  }
+
+  async function start() {
+    treeEvents(); typeEvents(); mapEvents(); pickerEvents(); splitters();
+    $('#btn-review').addEventListener('click', openReview);
+    document.querySelectorAll('#view-seg button').forEach(b => b.addEventListener('click', () => { if (b.dataset.view !== S.view) showView(b.dataset.view); }));
+    document.querySelectorAll('#view-seg button').forEach(b => b.classList.toggle('on', b.dataset.view === S.view));
+    $('#btn-undo').addEventListener('click', undo);
+    $('#btn-forks').addEventListener('click', openForks);
+    $('#btn-rescan').addEventListener('click', rescan);
+    $('#scrim').addEventListener('click', closeDrawer);
+    document.addEventListener('mousedown', (e) => {
+      if (!e.target.closest('#menu')) closeMenu();
+      if (!e.target.closest('#session-pop') && !e.target.closest('#session-btn')) closePicker();
+    });
+    document.addEventListener('keydown', (e) => {
+      const typing = e.target.closest && e.target.closest('input, textarea');
+      if (!$('#menu').classList.contains('hidden')) {
+        if (e.key === 'Escape') { closeMenu(); e.preventDefault(); return; }
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          menuKb = (menuKb + (e.key === 'ArrowDown' ? 1 : -1) + menuItems.length) % menuItems.length;
+          menuItems.forEach((m, i) => m.classList.toggle('kb', i === menuKb));
+          e.preventDefault(); e.stopPropagation(); return;
+        }
+        if (e.key === 'Enter' && menuItems[menuKb]) { menuItems[menuKb].click(); e.preventDefault(); return; }
+      }
+      if (e.key === 'Escape') { closePicker(); if (drawerMode) closeDrawer(); }
+      if (!typing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { undo(); e.preventDefault(); }
+      if (!typing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { openPicker(); e.preventDefault(); }
+    }, true);
+    let rt = 0;
+    new ResizeObserver(() => { clearTimeout(rt); rt = setTimeout(() => { layoutMap(); renderTree(); }, 60); }).observe($('#map-wrap'));
+    window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { hatch = null; layoutMap(); });
+
+    try { await loadSessions(); } catch (e) { $('#session-title').textContent = 'Could not load sessions'; toast(e.message, true); return; }
+    if (!S.sessions.length) { $('#session-title').textContent = 'No Claude Code sessions found'; return; }
+    const want = location.hash.slice(1);
+    const first = S.sessions.find(s => s.sid === want) || S.sessions[0];
+    await openSession(first.sid);
+    $('#tree').focus();
+  }
+  start();
 })();

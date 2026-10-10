@@ -1,10 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import readline from 'node:readline';
-import { execSync } from 'node:child_process';
-import { PROJECTS_DIR, FILE_HISTORY_DIR, prettyProject } from './paths.js';
-import { getLineage, saveLineage } from './prune.js';
+import { parseSession } from './session.js';
+import { forkSession, ForkError } from './fork.js';
+import { tokFor } from './model.js';
 
 // Common words to ignore in continuity keyword extraction
 const STOP_WORDS = new Set([
@@ -138,7 +136,7 @@ export function generateSmartBridge(block) {
 
     if (tool === 'Bash') {
       const lines = text.trim().split('\n').filter(Boolean);
-      const isError = /error|failed|exit status [1-9]|command not found|panic:|traceback/i.test(text);
+      const isError = block.isError || /error|failed|exit status [1-9]|command not found|panic:|traceback/i.test(text);
 
       if (isError) {
         // Find the critical error line so future debugging turns do not jump
@@ -149,7 +147,7 @@ export function generateSmartBridge(block) {
 
       const lastLine = lines[lines.length - 1] || 'Completed successfully.';
       const summary = lastLine.length > 90 ? lastLine.slice(0, 90) + '...' : lastLine;
-      return `[Context Bridge: Executed command${target ? ` \`${target}\`` : ''}. Succeeded (exit 0). Result: ${summary}]`;
+      return `[Context Bridge: Executed command${target ? ` \`${target}\`` : ''}. Completed. Last line of output: ${summary}]`;
     }
 
     if (tool === 'Grep' || tool === 'Glob') {
@@ -256,528 +254,208 @@ export function validateContinuity(blocks = [], stagedEdits = new Map()) {
 }
 
 /**
- * Loads the complete, editable paragraph context for a specific session.
+ * The editable view of one session. Every block carries:
+ *   live      - on the chain `claude --resume` loads. Editing a non-live block
+ *               (before the last compaction, or on an abandoned rewind branch)
+ *               changes the file but not the resumed context.
+ *   editable  - false for signed thinking and anything unsafe to rewrite; `lock`
+ *               says why.
+ *   fp        - fingerprint of the original text, echoed back on save so a
+ *               stale edit is refused instead of landing on changed content.
  */
 export function getSessionContext(sid, model) {
   const s = model.sessions.find(x => x.sid === sid);
-  if (!s) throw new Error(`Session ${sid} not found`);
+  if (!s) throw new ForkError(`Session ${sid} not found`);
+  const parsed = parseSession(fs.readFileSync(s.file, 'utf8'));
+  const tok = tokFor(model, s);
 
-  const raw = fs.readFileSync(s.file, 'utf8');
-  const lines = raw.split('\n');
-
-  const blocks = [];
-  const toolNameById = new Map();
-  const targetById = new Map();
-
-  let turn = 0;
-
-  for (let lineNum = 0; lineNum < lines.length; lineNum++) {
-    const line = lines[lineNum];
-    if (!line.trim()) continue;
-    let rec;
-    try { rec = JSON.parse(line); } catch { continue; }
-
-    const m = rec.message;
-    if (!m || typeof m !== 'object') continue;
-
-    const role = m.role || rec.type;
-    const content = m.content;
-    const contentBlocks = Array.isArray(content)
-      ? content
-      : (typeof content === 'string' ? [{ type: 'text', text: content }] : []);
-
-    for (let cIdx = 0; cIdx < contentBlocks.length; cIdx++) {
-      const b = contentBlocks[cIdx];
-      if (!b || typeof b !== 'object') continue;
-
-      let text = '';
-      let kind = b.type;
-      let tool = '';
-      let target = '';
-      let tuid = b.id || b.tool_use_id || '';
-
-      if (kind === 'text') {
-        text = b.text || '';
-      } else if (kind === 'thinking') {
-        text = b.thinking || b.text || '';
-      } else if (kind === 'tool_use') {
-        tool = b.name || '';
-        const inputObj = b.input || {};
-        target = inputObj.file_path || inputObj.path || inputObj.command || inputObj.query || inputObj.pattern || '';
-        if (target.length > 90) target = target.slice(0, 90);
-        text = JSON.stringify(inputObj, null, 2);
-        if (b.id) {
-          toolNameById.set(b.id, tool);
-          targetById.set(b.id, target);
-        }
-      } else if (kind === 'tool_result') {
-        tuid = b.tool_use_id || '';
-        tool = toolNameById.get(tuid) || b.tool || '';
-        target = targetById.get(tuid) || '';
-        const c = b.content;
-        if (typeof c === 'string') text = c;
-        else if (Array.isArray(c)) {
-          text = c.map(x => (x && x.type === 'text') ? (x.text || '') : JSON.stringify(x)).join('\n');
-          if (c.some(x => x && x.type === 'image')) kind = 'image';
-        } else text = JSON.stringify(c ?? '');
-      }
-
-      if (!text && !tool) continue;
-
-      const chars = text.length;
-      const tok = Math.max(1, Math.round(chars / 3.6));
-      const id = `blk_${lineNum}_${cIdx}`;
-
-      blocks.push({
-        id,
-        recordIndex: lineNum,
-        contentIndex: cIdx,
-        uuid: rec.uuid || '',
-        ts: rec.timestamp || '',
-        turn,
-        role,
-        kind,
-        tool,
-        target,
-        tuid,
-        chars,
-        tok,
-        alloc: tok,
-        text,
-        originalText: text,
-        isEdited: false,
-        keyTerms: extractKeyTerms(text, target),
-      });
-    }
-
-    if (rec.type === 'assistant' && m.usage) {
-      turn++;
+  // How many more times each live block was re-sent: live API calls after it.
+  const callsBefore = new Map();
+  const seen = new Set();
+  let liveCalls = 0;
+  for (const r of parsed.rows) {
+    callsBefore.set(r.line, liveCalls);
+    const o = r.rec, m = o && o.message;
+    if (o && o.type === 'assistant' && m && m.usage && !o.isSidechain && parsed.live.has(o.uuid)) {
+      const call = m.id || o.uuid;
+      if (!seen.has(call)) { seen.add(call); liveCalls++; }
     }
   }
 
-  const totalTurns = Math.max(1, turn);
-
-  // Compute residency, continuity links, and smart bridges
-  for (let i = 0; i < blocks.length; i++) {
-    const blk = blocks[i];
-    const liveTurns = Math.max(1, totalTurns - blk.turn);
-    blk.liveTurns = liveTurns;
-    blk.alloc = blk.tok * liveTurns;
-
-    const downstreamRefs = [];
-    if (blk.keyTerms && blk.keyTerms.length) {
-      for (let j = i + 1; j < Math.min(blocks.length, i + 35); j++) {
-        const nextBlk = blocks[j];
-        if (nextBlk.role === 'assistant' || (nextBlk.role === 'user' && nextBlk.kind === 'text')) {
-          for (const term of blk.keyTerms) {
-            if (nextBlk.text.includes(term)) {
-              downstreamRefs.push({
-                turn: nextBlk.turn,
-                role: nextBlk.role,
-                term,
-                snippet: nextBlk.text.slice(0, 60).replace(/\n/g, ' ')
-              });
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    blk.continuity = {
-      downstreamCount: downstreamRefs.length,
-      downstreamRefs: downstreamRefs.slice(0, 5),
-      riskLevel: downstreamRefs.length > 2 ? 'high' : (downstreamRefs.length > 0 ? 'medium' : 'low'),
+  const blocks = parsed.blocks.filter(b => !b.side && (b.text || b.tool)).map(b => {
+    const t = tok(b.chars, b.kind);
+    const liveTurns = b.live ? Math.max(1, liveCalls - (callsBefore.get(b.line) || 0)) : 0;
+    return {
+      id: b.id, uuid: b.uuid, fp: b.fp,
+      recordIndex: b.line, contentIndex: b.cIdx,
+      ts: b.ts, turn: b.turn, role: b.role, kind: b.kind, blockType: b.blockType,
+      tool: b.tool, target: b.target, tuid: b.tuid, isError: b.isError,
+      chars: b.chars, tok: t, liveTurns, alloc: t * Math.max(1, liveTurns),
+      live: b.live, editable: b.editable, lock: b.lock,
+      deadKind: b.deadKind || null, branchTip: b.branchTip || null,
+      text: b.text, originalText: b.text, isEdited: false,
+      keyTerms: extractKeyTerms(b.text, b.target),
     };
+  });
 
-    blk.suggestedBridge = generateSmartBridge(blk);
+  // Continuity: which later live turns mention this block's key terms.
+  const liveBlocks = blocks.filter(b => b.live);
+  const pos = new Map(liveBlocks.map((b, i) => [b.id, i]));
+  for (const blk of blocks) {
+    const refs = [];
+    const i = pos.get(blk.id);
+    if (i !== undefined && blk.keyTerms.length) {
+      for (let j = i + 1; j < Math.min(liveBlocks.length, i + 35); j++) {
+        const nb = liveBlocks[j];
+        if (!(nb.role === 'assistant' || (nb.role === 'user' && nb.kind === 'text'))) continue;
+        const term = blk.keyTerms.find(t => nb.text.includes(t));
+        if (term) refs.push({ turn: nb.turn, role: nb.role, term, snippet: nb.text.slice(0, 60).replace(/\n/g, ' ') });
+      }
+    }
+    blk.continuity = {
+      downstreamCount: refs.length,
+      downstreamRefs: refs.slice(0, 5),
+      riskLevel: refs.length > 2 ? 'high' : (refs.length > 0 ? 'medium' : 'low'),
+    };
+    blk.suggestedBridge = blk.editable ? generateSmartBridge(blk) : '';
   }
 
-  // Group blocks by Prompt Regions
+  // Regions: a new one at every real prompt; token totals count live content only.
   const regions = [];
-  let curRegion = null;
-
-  blocks.forEach(b => {
-    if (b.role === 'user' && b.kind === 'text' && b.text.trim().length > 10 && !b.text.startsWith('<local-command')) {
-      if (curRegion) regions.push(curRegion);
-      curRegion = {
-        id: regions.length,
-        prompt: b.text.trim().slice(0, 100).replace(/\n/g, ' '),
-        turn: b.turn,
-        blocksCount: 0,
-        tok: 0,
-        alloc: 0,
-        blocks: [],
-      };
+  let cur = null;
+  for (const b of blocks) {
+    const isPrompt = b.role === 'user' && b.kind === 'text' && b.text.trim().length > 10 &&
+      !/^(<local-command|<command-|\[Request interrupted)/.test(b.text.trim());
+    if (isPrompt || !cur) {
+      if (cur) regions.push(cur);
+      cur = { id: regions.length, prompt: isPrompt ? b.text.trim().slice(0, 100).replace(/\n/g, ' ') : '(session start)',
+        turn: b.turn, blocksCount: 0, tok: 0, alloc: 0, deadTok: 0, live: false, blocks: [] };
     }
-    if (!curRegion) {
-      curRegion = {
-        id: 0,
-        prompt: '(Initial setup / session start)',
-        turn: 0,
-        blocksCount: 0,
-        tok: 0,
-        alloc: 0,
-        blocks: [],
-      };
-    }
-    curRegion.blocksCount++;
-    curRegion.tok += b.tok;
-    curRegion.alloc += b.alloc;
-    curRegion.blocks.push(b.id);
-    b.regionId = curRegion.id;
-  });
-  if (curRegion) regions.push(curRegion);
+    cur.blocksCount++; cur.blocks.push(b.id);
+    if (b.live) { cur.tok += b.tok; cur.alloc += b.alloc; cur.live = true; } else cur.deadTok += b.tok;
+    b.regionId = cur.id;
+  }
+  if (cur) regions.push(cur);
 
+  const live = blocks.filter(b => b.live);
   return {
-    sid,
-    projectName: s.projectName,
-    project: s.project,
-    file: s.file,
-    totalTurns,
+    sid, projectName: s.projectName, project: s.project, file: s.file, cwd: s.cwd,
+    totalTurns: Math.max(1, liveCalls),
     totalBlocks: blocks.length,
-    totalTokens: blocks.reduce((a, b) => a + b.tok, 0),
-    totalAlloc: blocks.reduce((a, b) => a + b.alloc, 0),
-    regions,
-    blocks,
+    liveBlocks: live.length,
+    deadBlocks: blocks.length - live.length,
+    lockedBlocks: blocks.filter(b => !b.editable).length,
+    totalTokens: live.reduce((a, b) => a + b.tok, 0),          // what resume loads
+    deadTokens: blocks.reduce((a, b) => a + (b.live ? 0 : b.tok), 0),
+    totalAlloc: live.reduce((a, b) => a + b.alloc, 0),
+    compacts: s.compacts || 0,
+    regions, blocks,
   };
 }
 
-/**
- * Saves modified context paragraphs into a new forked session without jumps.
- */
+/** Writes the staged edits into a new fork. The browser's token numbers are ignored. */
 export async function saveEditedSessionContext({ sid, edits = [], note = '' }, model) {
-  if (!sid) throw new Error('Session ID (sid) is required');
-  if (!edits || edits.length === 0) throw new Error('No edits provided');
-
   const s = model.sessions.find(x => x.sid === sid);
-  if (!s) throw new Error(`Session ${sid} not found`);
-
-  const forkSid = crypto.randomUUID();
-  const origFile = s.file;
-  const projectDir = path.dirname(origFile);
-  const forkFile = path.join(projectDir, `${forkSid}.jsonl`);
-
-  const editMap = new Map();
-  let savedTok = 0;
-  let savedAlloc = 0;
-
-  edits.forEach(e => {
-    const list = editMap.get(e.recordIndex) || new Map();
-    list.set(e.contentIndex, e);
-    editMap.set(e.recordIndex, list);
-    savedTok += (e.tokBefore || 0) - (e.tokAfter || 0);
-    savedAlloc += (e.allocBefore || 0) - (e.allocAfter || 0);
-  });
-
-  const inputStream = fs.createReadStream(origFile, { encoding: 'utf8' });
-  const outputStream = fs.createWriteStream(forkFile, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: inputStream, crlfDelay: Infinity });
-
-  let lineNum = 0;
-  let modifiedRecords = 0;
-
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      outputStream.write(line + '\n');
-      lineNum++;
-      continue;
-    }
-
-    if (rec.sessionId) rec.sessionId = forkSid;
-    if (rec.session_id) rec.session_id = forkSid;
-
-    let touched = false;
-    const editsForLine = editMap.get(lineNum);
-
-    if (editsForLine) {
-      if (rec.message) {
-        if (Array.isArray(rec.message.content)) {
-          for (const [cIdx, edit] of editsForLine.entries()) {
-            const item = rec.message.content[cIdx];
-            if (!item) continue;
-
-            if (item.type === 'text') {
-              item.text = edit.newText;
-              touched = true;
-            } else if (item.type === 'thinking') {
-              item.thinking = edit.newText;
-              touched = true;
-            } else if (item.type === 'tool_result') {
-              if (typeof item.content === 'string') {
-                item.content = edit.newText;
-              } else if (Array.isArray(item.content)) {
-                item.content = [{ type: 'text', text: edit.newText }];
-              } else {
-                item.content = edit.newText;
-              }
-              touched = true;
-            } else if (item.type === 'tool_use') {
-              try {
-                item.input = JSON.parse(edit.newText);
-              } catch {}
-              touched = true;
-            }
-          }
-        } else if (typeof rec.message.content === 'string') {
-          const edit = editsForLine.get(0);
-          if (edit) {
-            rec.message.content = edit.newText;
-            touched = true;
-          }
-        }
-      } else if (rec.content) {
-        if (typeof rec.content === 'string') {
-          const edit = editsForLine.get(0);
-          if (edit) {
-            rec.content = edit.newText;
-            touched = true;
-          }
-        }
-      }
-    }
-
-    if (touched) modifiedRecords++;
-    outputStream.write(JSON.stringify(rec) + '\n');
-    lineNum++;
-  }
-
-  await new Promise(resolve => outputStream.end(resolve));
-
-  // Clone file-history using APFS CoW
-  const srcHistory = path.join(FILE_HISTORY_DIR, sid);
-  const dstHistory = path.join(FILE_HISTORY_DIR, forkSid);
-  let clonedHistory = false;
-
-  if (fs.existsSync(srcHistory)) {
-    try {
-      execSync(`cp -c -R "${srcHistory}" "${dstHistory}" 2>/dev/null`);
-      clonedHistory = true;
-    } catch {
-      try {
-        fs.cpSync(srcHistory, dstHistory, { recursive: true });
-        clonedHistory = true;
-      } catch (err) {
-        console.warn(`Failed to copy file-history from ${sid} to ${forkSid}:`, err.message);
-      }
-    }
-  }
-
-  const lineageEntry = {
-    forkSid,
-    parentSid: sid,
-    project: s.project,
-    projectName: prettyProject(s.project),
-    file: forkFile,
-    createdAt: new Date().toISOString(),
-    editedBlocksCount: edits.length,
-    modifiedRecords,
-    savedTok: Math.max(0, savedTok),
-    savedAlloc: Math.max(0, savedAlloc),
-    clonedHistory,
-    note: note || `Context edited with ctxtree (${edits.length} paragraphs tailored without jumps)`
-  };
-
-  const currentLineage = getLineage();
-  saveLineage([lineageEntry, ...currentLineage]);
-
-  return {
-    ok: true,
-    forkSid,
-    parentSid: sid,
-    projectName: prettyProject(s.project),
-    savedTok: Math.max(0, savedTok),
-    savedAlloc: Math.max(0, savedAlloc),
-    editedBlocksCount: edits.length,
-    forkFile,
-    resumeCmd: `claude --resume ${forkSid}`,
-    clonedHistory
-  };
+  if (!s) throw new ForkError(`Session ${sid} not found`);
+  if (!edits.length) throw new ForkError('No edits provided');
+  const clean = edits.map(e => ({ id: e.id, fp: e.fp, newText: e.newText, op: e.op }));
+  const res = forkSession(s, clean, { tok: tokFor(model, s), note, kind: 'edit' });
+  return { ...res, editedBlocksCount: res.edits };
 }
 
-/**
- * Synthesizes an entire prompt region into a cohesive milestone,
- * replacing bloated intermediate outputs with concise step bridges
- * and a unified milestone conclusion that preserves all downstream anchors.
- */
+/** Collapse a prompt region: every live, editable output becomes a short step marker. */
 export function synthesizeRegionMilestone(regionId, sid, model) {
   const ctx = getSessionContext(sid, model);
   const region = ctx.regions.find(r => r.id === regionId);
-  if (!region) throw new Error(`Region ${regionId} not found`);
-
-  const regionBlocks = ctx.blocks.filter(b => b.regionId === regionId);
+  if (!region) throw new ForkError(`Region ${regionId} not found`);
+  const regionBlocks = ctx.blocks.filter(b => b.regionId === regionId && b.live && b.editable);
   if (!regionBlocks.length) return [];
 
-  const toolsUsed = new Set();
-  const filesTouched = new Set();
-  const allAnchors = new Set();
-
-  regionBlocks.forEach(b => {
+  const toolsUsed = new Set(), filesTouched = new Set(), allAnchors = new Set();
+  for (const b of regionBlocks) {
     if (b.tool) toolsUsed.add(b.tool);
     if (b.target) filesTouched.add(path.basename(b.target));
-    if (b.continuity?.downstreamRefs) {
-      b.continuity.downstreamRefs.forEach(r => allAnchors.add(r.term));
-    }
-  });
+    for (const r of b.continuity.downstreamRefs) allAnchors.add(r.term);
+  }
+  const lastAssistant = [...regionBlocks].reverse().find(b => b.role === 'assistant' && b.kind === 'text');
+  const tok = tokFor(model, model.sessions.find(x => x.sid === sid));
 
   const edits = [];
-  // Find last assistant response block in this region
-  let lastAssistantBlock = null;
-  for (let i = regionBlocks.length - 1; i >= 0; i--) {
-    if (regionBlocks[i].role === 'assistant' && (regionBlocks[i].kind === 'text' || regionBlocks[i].kind === 'thinking')) {
-      lastAssistantBlock = regionBlocks[i];
-      break;
-    }
-  }
-
-  regionBlocks.forEach(b => {
-    // Preserve primary user prompt unmodified
-    if (b.role === 'user' && b.kind === 'text') return;
-
-    let bridgeText = '';
-
-    if (b === lastAssistantBlock) {
-      // Synthesize unified milestone summary
-      const toolsPart = toolsUsed.size ? `Tools: ${Array.from(toolsUsed).join(', ')}` : '';
-      const filesPart = filesTouched.size ? `Files: ${Array.from(filesTouched).slice(0, 5).join(', ')}` : '';
-      const anchorPart = allAnchors.size ? `\n[Continuity Anchors: ${Array.from(allAnchors).slice(0, 10).join(', ')}]` : '';
-      const summaryParts = [toolsPart, filesPart].filter(Boolean).join(' | ');
-
-      bridgeText = `[Milestone Summary: Addressed "${region.prompt.slice(0, 80)}". ${summaryParts}. Execution complete for downstream continuation.]${anchorPart}`;
-    } else if (b.kind === 'tool_result') {
+  for (const b of regionBlocks) {
+    if (b.role === 'user' && b.kind === 'text') continue;   // your prompt stays verbatim
+    if (b.blockType === 'tool_use') continue;               // calls stay; their results shrink
+    let text;
+    if (b === lastAssistant) {
+      const parts = [toolsUsed.size ? `Tools: ${[...toolsUsed].join(', ')}` : '', filesTouched.size ? `Files: ${[...filesTouched].slice(0, 5).join(', ')}` : ''].filter(Boolean).join(' | ');
+      const anchors = allAnchors.size ? `\n[Continuity Anchors: ${[...allAnchors].slice(0, 10).join(', ')}]` : '';
+      text = `[Milestone Summary: Addressed "${region.prompt.slice(0, 80)}". ${parts}.]${anchors}`;
+    } else if (b.kind === 'tool_result' || b.kind === 'image') {
       const fileName = b.target ? path.basename(b.target) : '';
-      bridgeText = `[Step completed: ${b.tool || 'Tool'}${fileName ? ` on ${fileName}` : ''}]`;
-    } else if (b.kind === 'tool_use') {
-      return; // leave tool_use as is
+      text = `[Step completed: ${b.tool || 'Tool'}${fileName ? ` on ${fileName}` : ''}${b.isError ? ' (failed)' : ''}]`;
     } else {
-      bridgeText = `[Intermediate reasoning in milestone execution condensed.]`;
+      text = '[Intermediate reasoning condensed.]';
     }
-
-    const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
-    edits.push({
-      id: b.id,
-      recordIndex: b.recordIndex,
-      contentIndex: b.contentIndex,
-      newText: bridgeText,
-      tokBefore: b.tok,
-      tokAfter: newTok,
-      allocBefore: b.alloc,
-      allocAfter: newTok * b.liveTurns,
-      isBridged: true,
-      note: 'Synthesized region milestone'
-    });
-  });
-
+    const after = tok(text.length, 'text');
+    if (after >= b.tok) continue;                            // never "condense" into something bigger
+    edits.push({ id: b.id, fp: b.fp, recordIndex: b.recordIndex, contentIndex: b.contentIndex, newText: text,
+      tokBefore: b.tok, tokAfter: after, allocBefore: b.alloc, allocAfter: after * Math.max(1, b.liveTurns),
+      isBridged: true, note: 'Synthesized region milestone' });
+  }
   return edits;
 }
 
-/**
- * Reconstructs and simulates the exact conversational stream that Claude Code
- * will receive on `claude --resume <sid>`, calculating token savings and continuity health.
- */
+/** The conversation `claude --resume` would load: live blocks only, with edits applied. */
 export function simulateResumedSession(sid, edits = [], model) {
   const ctx = getSessionContext(sid, model);
-  const editMap = new Map();
-  edits.forEach(e => editMap.set(e.id, e));
-
-  let totalOriginalTok = 0;
-  let totalSimulatedTok = 0;
-
-  const simulatedTurns = [];
+  const tok = tokFor(model, model.sessions.find(x => x.sid === sid));
+  const editMap = new Map((edits || []).map(e => [e.id, e]));
+  let before = 0, after = 0;
+  const turns = [];
   let curTurn = null;
-
-  ctx.blocks.forEach(b => {
-    totalOriginalTok += b.tok;
-    const edit = editMap.get(b.id);
+  for (const b of ctx.blocks) {
+    if (!b.live) continue;
+    const edit = b.editable ? editMap.get(b.id) : null;
     const text = edit ? edit.newText : b.text;
-    const tok = edit ? edit.tokAfter : b.tok;
-    totalSimulatedTok += tok;
-
+    const t = edit ? tok(text.length, 'text') : b.tok;
+    before += b.tok; after += t;
     if (!curTurn || curTurn.turn !== b.turn) {
-      if (curTurn) simulatedTurns.push(curTurn);
-      curTurn = {
-        turn: b.turn,
-        role: b.role,
-        messages: [],
-        tok: 0
-      };
+      if (curTurn) turns.push(curTurn);
+      curTurn = { turn: b.turn, role: b.role, messages: [], tok: 0 };
     }
-
-    curTurn.messages.push({
-      id: b.id,
-      role: b.role,
-      kind: b.kind,
-      tool: b.tool,
-      target: b.target,
-      text,
-      tok,
-      isEdited: !!edit,
-    });
-    curTurn.tok += tok;
-  });
-
-  if (curTurn) simulatedTurns.push(curTurn);
-
-  const validation = validateContinuity(ctx.blocks, editMap);
-  const savedTok = Math.max(0, totalOriginalTok - totalSimulatedTok);
-  const pctSaved = totalOriginalTok > 0 ? ((savedTok / totalOriginalTok) * 100).toFixed(1) : '0.0';
-
+    curTurn.messages.push({ id: b.id, role: b.role, kind: b.kind, tool: b.tool, target: b.target, text, tok: t, isEdited: !!edit });
+    curTurn.tok += t;
+  }
+  if (curTurn) turns.push(curTurn);
+  const liveEdits = new Map([...editMap].filter(([id]) => ctx.blocks.some(b => b.id === id && b.live)));
+  const savedTok = Math.max(0, before - after);
   return {
-    sid,
-    totalOriginalTok,
-    totalSimulatedTok,
-    savedTok,
-    pctSaved,
-    continuity: validation,
-    turnsCount: simulatedTurns.length,
-    turns: simulatedTurns
+    sid, totalOriginalTok: before, totalSimulatedTok: after, savedTok,
+    pctSaved: before > 0 ? ((savedTok / before) * 100).toFixed(1) : '0.0',
+    ignoredEdits: editMap.size - liveEdits.size,
+    continuity: validateContinuity(ctx.blocks, liveEdits),
+    turnsCount: turns.length, turns,
   };
 }
 
-/**
- * Programmatic / CLI quick-bridge: finds all tool results >= threshold tokens,
- * applies smart continuity bridges and contracts, forks the session, and returns the result.
- */
-export async function quickBridgeSession({ sid, threshold = 2500, note = '' }, model) {
+/** Bridge every live tool output at or above `threshold` tokens, then fork. */
+export async function quickBridgeSession({ sid, threshold = 2500, note = '', dryRun = false }, model) {
+  const s = model.sessions.find(x => x.sid === sid);
+  if (!s) throw new ForkError(`Session ${sid} not found`);
   const ctx = getSessionContext(sid, model);
-  const heavyBlocks = ctx.blocks.filter(b => b.tok >= threshold && (b.kind === 'tool_result' || b.kind === 'tool_use' || b.kind === 'image' || b.kind === 'thinking'));
-
-  if (heavyBlocks.length === 0) {
-    return { ok: false, message: `No blocks >= ${threshold} tokens found in session ${sid}` };
-  }
-
-  const edits = heavyBlocks.map(b => {
-    let bridgeText = b.suggestedBridge;
+  const tok = tokFor(model, s);
+  const heavy = ctx.blocks.filter(b => b.live && b.editable && b.tok >= threshold && (b.kind === 'tool_result' || b.kind === 'image'));
+  const edits = [];
+  for (const b of heavy) {
+    let text = b.suggestedBridge;
     if (b.tool === 'Read' && b.target) {
       const contract = extractContract(b.text, b.target);
-      if (contract.startsWith('[Interface Contract') || contract.startsWith('[JSON Outline')) {
-        bridgeText = contract;
-      }
+      if (contract.startsWith('[Interface Contract') || contract.startsWith('[JSON Outline')) text = contract;
     }
-
-    // Auto-heal anchors for guaranteed zero jumps
-    bridgeText = autoHealBridgeText(b, bridgeText);
-
-    const newTok = Math.max(1, Math.round(bridgeText.length / 3.6));
-    return {
-      id: b.id,
-      recordIndex: b.recordIndex,
-      contentIndex: b.contentIndex,
-      newText: bridgeText,
-      tokBefore: b.tok,
-      tokAfter: newTok,
-      allocBefore: b.alloc,
-      allocAfter: newTok * b.liveTurns,
-    };
-  });
-
-  return await saveEditedSessionContext({
-    sid,
-    edits,
-    note: note || `Quick bridged ${edits.length} heavy blocks >= ${threshold} tok without jumps`
-  }, model);
+    text = autoHealBridgeText(b, text);
+    if (tok(text.length, 'text') >= b.tok) continue;
+    edits.push({ id: b.id, fp: b.fp, newText: text });
+  }
+  if (!edits.length) return { ok: false, message: `No live tool output of ${threshold}+ tokens that a bridge would shrink.` };
+  const res = forkSession(s, edits, { tok, dryRun, kind: 'bridge', note: note || `Bridged ${edits.length} tool output(s) >= ${threshold} tok` });
+  return { ...res, editedBlocksCount: res.edits };
 }

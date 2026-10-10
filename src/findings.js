@@ -1,4 +1,5 @@
 import { serverOf } from './attach.js';
+import { BOOT_SUB } from './boot.js';
 
 // Two tiers, never summed together. Tier 1 asserts only what the logs record.
 // Tier 2 is inference and must print the proxy it used, so a wrong row is
@@ -13,10 +14,10 @@ export function findings(model) {
     const v = model.byId.get(s.sid);
     for (const c of v.chunks) {
       if (c.side) continue;
-      if (c.cat === 'boot' && c.sub === 'tool schemas' && c.leaf && c.leaf.startsWith('MCP: ')) {
-        const srv = c.leaf.slice(5);
+      if (c.cat === 'boot' && c.sub === BOOT_SUB.mcp && c.leaf) {
+        const srv = c.leaf;
         const e = schemaByServer.get(srv) || { tok: 0, alloc: 0, tools: 0, sessions: new Set() };
-        e.tok += c.tok; e.alloc += c.alloc; e.tools = Math.max(e.tools, c.n || 0); e.sessions.add(s.sid);
+        e.tok += c.tok; e.alloc += c.alloc; if (c.part !== 'instructions') e.tools = Math.max(e.tools, c.n || 0); e.sessions.add(s.sid);
         schemaByServer.set(srv, e);
       }
       if (c.kind === 'tool_use' && c.tool) {
@@ -34,11 +35,11 @@ export function findings(model) {
       action: calls === 0 ? `Disable MCP server "${srv}"` : `Consider disabling "${srv}"`,
       saves: e.alloc, size: e.tok,
       evidence: [
-        `${e.tools || '?'} tool schemas resident, ${e.tok.toLocaleString()} tokens`,
+        `${e.tools || '?'} tools plus instructions resident, ${e.tok.toLocaleString()} tokens`,
         `${calls} call${calls === 1 ? '' : 's'} across ${e.sessions.size} session${e.sessions.size === 1 ? '' : 's'}`,
         `re-shipped every turn: ${e.alloc.toLocaleString()} tokens allocated`,
       ],
-      how: 'Config change - takes effect on your next session.',
+      how: 'Right-click it in the tree (boot overhead > MCP servers) and remove it from a fork: its tools are denied at launch and its instructions dropped from the transcript. Or disable it in your config for every future session.',
     });
   }
 
@@ -112,7 +113,7 @@ export function findings(model) {
     }
   }
   for (const [key, e] of [...resident].sort((a, b) => b[1].alloc - a[1].alloc).slice(0, 8)) {
-    if (e.sub === 'tool schemas' && (e.leaf || '').startsWith('MCP: ')) continue; // already tier 1
+    if (e.sub === BOOT_SUB.mcp) continue; // already tier 1
     if (e.alloc < 5_000_000) continue;
     inferred.push({
       tier: 2, kind: 'resident', id: `res:${key}`,
@@ -124,7 +125,7 @@ export function findings(model) {
         `re-shipped every turn: ${e.alloc.toLocaleString()} tokens allocated`,
       ],
       proxy: 'Proxy: residency x size. Says nothing about whether the content earns its place.',
-      how: 'Config change - trim the source file or listing.',
+      how: 'Remove it from a fork (right-click in the tree), or trim the source file or listing for every future session.',
     });
   }
 

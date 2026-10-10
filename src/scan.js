@@ -104,6 +104,11 @@ export function scanSession({ project, sid, file, subagents = [] }) {
   let prevTotal = null, prevCum = null, compacts = 0, records = 0;
   let turn = 0;                 // index of the next assistant API turn
   let thinkTokens = 0, outTokens = 0, shipped = 0;
+  // One API response is written as several records sharing message.id, each
+  // repeating usage. A turn is a distinct call; counting records inflated turns,
+  // residency and the "measured" shipped total by ~2.3x.
+  const seenCalls = new Set();
+  const callOut = new Map(), callThink = new Map();
   const compactTurns = [];      // turns at which context was wiped
   const snapParts = new Map();  // resident snapshots, deduped by node key
   let residentChars = 0;        // size of the always-resident prefix
@@ -118,6 +123,8 @@ export function scanSession({ project, sid, file, subagents = [] }) {
     try { o = JSON.parse(line); } catch { continue; }
     records++;
     idx++;
+    // The input of a call is everything written before its first record.
+    const preCum = (o.type === 'assistant' && o.message && o.message.usage && !o.isSidechain) ? { ...cum } : null;
 
     if (o.cwd && !cwd) cwd = o.cwd;
     if (o.gitBranch && !gitBranch) gitBranch = o.gitBranch;
@@ -131,7 +138,7 @@ export function scanSession({ project, sid, file, subagents = [] }) {
       if (r) for (const part of r.parts) {
         if (!part.chars) continue;
         if (!sidechainAttach && !r.resident) cum.attach = (cum.attach || 0) + part.chars;
-        const key = `${part.cat}|${part.sub}|${part.leaf || ''}`;
+        const key = `${part.cat}|${part.sub}|${part.leaf || ''}|${part.part || ''}`;
         if (r.resident) {
           // The resident prefix is present from the first request. A snapshot is a
           // RECORD of it, not new content -- counting it where it was written makes
@@ -139,7 +146,7 @@ export function scanSession({ project, sid, file, subagents = [] }) {
           // largest statement per node, and let a snapshot supersede deltas.
           const prev = snapParts.get(key);
           const isSnap = !!r.snapshot;
-          if (isSnap) deltaCovered.add(`${part.cat}|${part.sub}`);
+          if (isSnap) deltaCovered.add(key);
           if (!prev) snapParts.set(key, { ...part, turn: 0, chars: part.chars, snap: isSnap });
           else if (isSnap && !prev.snap) { prev.chars = part.chars; prev.snap = true; if (part.n) prev.n = part.n; }
           else if (isSnap === prev.snap) {
@@ -216,13 +223,16 @@ export function scanSession({ project, sid, file, subagents = [] }) {
     // Calibration + boot anchor from measured usage.
     if (o.type === 'assistant' && m.usage && !sidechain) {
       const u = m.usage;
-      const total = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+      const call = m.id || o.uuid;
       const think = (u.output_tokens_details && u.output_tokens_details.thinking_tokens) || 0;
-      if (think > 0) thinkTokens += think;
-      outTokens += (u.output_tokens || 0);
-      shipped += total;   // every turn re-ships the whole context: this IS Allocated
+      callOut.set(call, Math.max(callOut.get(call) || 0, u.output_tokens || 0));
+      callThink.set(call, Math.max(callThink.get(call) || 0, think));
+      if (seenCalls.has(call)) continue;          // same call, repeated usage
+      seenCalls.add(call);
+      const total = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+      shipped += total;   // every call re-ships the whole context: this IS Allocated
       if (total > 0) {
-        const snap = { ...cum };
+        const snap = preCum;
         if (bootAnchor === null) {
           bootAnchor = { total, chars: Object.values(snap).reduce((a, b) => a + b, 0), cum: snap };
         }
@@ -242,13 +252,16 @@ export function scanSession({ project, sid, file, subagents = [] }) {
     }
   }
 
+  for (const v of callOut.values()) outTokens += v;
+  for (const v of callThink.values()) thinkTokens += v;
+
   // Resident snapshots become one chunk each, introduced at their first sighting.
   for (const [key, part] of snapParts) {
-    if (!part.snap && deltaCovered.has(`${part.cat}|${part.sub}`)) continue; // snapshot already authoritative
+    if (!part.snap && deltaCovered.has(key)) continue; // snapshot already authoritative
     residentChars += part.chars;
     chunks.push({ i: 0, turn: 0, kind: 'attach', cat: part.cat, sub: part.sub,
       leaf: part.leaf || '', role: 'attachment', tool: '', target: part.leaf || '',
-      tuid: '', chars: part.chars, n: part.n, fp: `r.${key}`, uuid: '', ts: firstTs,
+      tuid: '', chars: part.chars, n: part.n, part: part.part || '', fp: `r.${key}`, uuid: '', ts: firstTs,
       side: 0, resident: 1, exact: part.exact !== false });
   }
 
@@ -295,11 +308,13 @@ function scanAgent({ agent, type = 'subagent', file }, startIdx) {
   const toolNameById = new Map(), targetById = new Map();
   let idx = startIdx, peak = 0, records = 0, prevTotal = null, prevCum = null, aturn = 0, ashipped = 0;
   let cum = { text: 0, thinking: 0, tool_use: 0, tool_result: 0, image: 0 };
+  const seenCalls = new Set();
 
   for (const line of raw.split('\n')) {
     if (!line) continue;
     let o; try { o = JSON.parse(line); } catch { continue; }
     records++; idx++;
+    const preCum = (o.type === 'assistant' && o.message && o.message.usage) ? { ...cum } : null;
     const m = o.message;
     if (!m || typeof m !== 'object') continue;
     const content = m.content;
@@ -336,10 +351,13 @@ function scanAgent({ agent, type = 'subagent', file }, startIdx) {
     }
 
     if (o.type === 'assistant' && m.usage) {
+      const call = m.id || o.uuid;
+      if (seenCalls.has(call)) continue;
+      seenCalls.add(call);
       const u = m.usage;
       const total = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
       if (total > 0) {
-        const snap = { ...cum };
+        const snap = preCum;
         if (prevTotal !== null && total > prevTotal) {
           const d = {}; let any = false;
           for (const k of Object.keys(snap)) {
@@ -352,8 +370,6 @@ function scanAgent({ agent, type = 'subagent', file }, startIdx) {
         prevTotal = total; prevCum = snap; peak = Math.max(peak, total); ashipped += total;
       }
       aturn++;
-      if (false) {
-      }
     }
   }
   return { agent: { agent, type, file, records, peak, shipped: ashipped, bytes: raw.length, nChunks: chunks.length },

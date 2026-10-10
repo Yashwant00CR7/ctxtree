@@ -78,3 +78,12 @@ export function build(root = PROJECTS_DIR) {
     },
   };
 }
+
+// One token estimator for everything that reports numbers about a session:
+// the calibrated per-kind ratio, scaled by that session's measured anchor.
+export function tokFor(model, session) {
+  const scale = session && session.scale ? session.scale : 1;
+  return (chars, kind) => kind === 'image'
+    ? tokensOf(0, 'image', model.cal)
+    : Math.max(1, Math.round(tokensOf(chars, kind, model.cal) * scale));
+}

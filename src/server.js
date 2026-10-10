@@ -1,12 +1,17 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { ForkError } from './fork.js';
+import { UUID_RE } from './session.js';
 import { build } from './model.js';
 import { buildTree, projectBreakdown } from './tree.js';
 import { buildRegions } from './regions.js';
 import { findings } from './findings.js';
 import { pruneSession, getLineage, revertFork } from './prune.js';
+import { bootView, structureView, nodePlan, applySurgery } from './surgery.js';
+import { contextMap, blockPreview, sessionTitle } from './map.js';
 import {
   getSessionContext,
   saveEditedSessionContext,
@@ -35,6 +40,10 @@ const MIME = {
 export class CtxServer {
   constructor(options = {}) {
     this.port = options.port || 3888;
+    this.host = '127.0.0.1';
+    // Every API call must carry this. It is only ever handed to a page served by
+    // this process, so another website -- or a LAN host -- cannot drive the API.
+    this.token = crypto.randomBytes(24).toString('hex');
     this.model = null;
     this.cachedFindings = null;
     this.server = null;
@@ -45,7 +54,7 @@ export class CtxServer {
       console.log('Building ctxtree model...');
       const t0 = Date.now();
       this.model = build();
-      this.cachedFindings = findings(this.model);
+      this.cachedFindings = findings(this.model);   // rebuilt with every model
       console.log(`Model ready in ${Date.now() - t0}ms (${this.model.sessions.length} sessions, ${(this.model.stats.alloc / 1e6).toFixed(1)}M alloc tokens)`);
     }
     return this.model;
@@ -71,13 +80,13 @@ export class CtxServer {
         if (err.code === 'EADDRINUSE') {
           console.warn(`Port ${this.port} is busy, trying ${this.port + 1}...`);
           this.port++;
-          this.server.listen(this.port);
+          this.server.listen(this.port, this.host);
         } else {
           reject(err);
         }
       });
 
-      this.server.listen(this.port, () => {
+      this.server.listen(this.port, this.host, () => {
         resolve({ port: this.port, url: `http://localhost:${this.port}` });
       });
     });
@@ -90,43 +99,76 @@ export class CtxServer {
     });
   }
 
+  // Only this machine, only through a name that resolves here. Checking Host
+  // defeats DNS rebinding; checking Origin + token defeats cross-site requests.
+  allowedHost(host) {
+    return [`localhost:${this.port}`, `127.0.0.1:${this.port}`, `[::1]:${this.port}`].includes(String(host || '').toLowerCase());
+  }
+
   async handle(req, res) {
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const security = {
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+      'Cache-Control': 'no-store',
+    };
+    const deny = (status, msg) => { res.writeHead(status, { 'Content-Type': 'text/plain', ...security }); res.end(msg); };
+
+    if (!this.allowedHost(req.headers.host)) return deny(421, 'ctxtree only answers on localhost.');
+
+    const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
     const pathname = parsedUrl.pathname;
     const method = req.method;
 
-    // Helper to send JSON
     const sendJson = (data, status = 200) => {
-      res.writeHead(status, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      });
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...security });
       res.end(JSON.stringify(data));
     };
+    const sendError = (err) => {
+      if (err instanceof ForkError) return sendJson({ error: err.message, problems: err.problems || [] }, 400);
+      console.error(err);
+      return sendJson({ error: err.message || 'Internal error' }, 500);
+    };
 
-    // Helper to read JSON body
+    const MAX_BODY = 32 * 1024 * 1024;
     const readBody = () => new Promise((resolve, reject) => {
-      let body = '';
-      req.on('data', chunk => { body += chunk; });
+      const parts = []; let size = 0;
+      req.on('data', chunk => {
+        size += chunk.length;
+        if (size > MAX_BODY) { reject(new ForkError('Request body too large.')); req.destroy(); return; }
+        parts.push(chunk);
+      });
       req.on('end', () => {
+        const body = Buffer.concat(parts).toString('utf8');
         try { resolve(body ? JSON.parse(body) : {}); }
-        catch (e) { reject(new Error('Invalid JSON body')); }
+        catch { reject(new ForkError('Invalid JSON body')); }
       });
       req.on('error', reject);
     });
 
-    if (method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      });
-      return res.end();
+    // No CORS, ever: preflights are refused, so cross-origin writes cannot start.
+    if (method === 'OPTIONS') return deny(405, 'Not allowed');
+
+    if (pathname.startsWith('/api/')) {
+      const origin = req.headers.origin;
+      if (origin && !this.allowedHost(origin.replace(/^https?:\/\//, ''))) return deny(403, 'Cross-origin request refused.');
+      const token = String(req.headers['x-ctxtree-token'] || '');
+      const ok = token.length === this.token.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(this.token));
+      if (!ok) return deny(403, 'Missing or invalid ctxtree token. Reload the page.');
+      if (method === 'POST' && !String(req.headers['content-type'] || '').startsWith('application/json'))
+        return deny(415, 'Expected application/json');
+      const sidParam = parsedUrl.searchParams.get('sid');
+      if (sidParam && sidParam !== 'all' && !UUID_RE.test(sidParam)) return sendJson({ error: 'Invalid sid' }, 400);
+      try {
+        return await this.handleApi(req, res, { parsedUrl, pathname, method, sendJson, sendError, readBody });
+      } catch (err) { return sendError(err); }
     }
 
-    // API Routes
-    if (pathname.startsWith('/api/')) {
+    return this.serveStatic(pathname, res, security);
+  }
+
+  async handleApi(req, res, { parsedUrl, pathname, method, sendJson, sendError, readBody }) {
+    {
       const model = this.ensureModel();
 
       if (pathname === '/api/stats' && method === 'GET') {
@@ -153,6 +195,9 @@ export class CtxServer {
           fit: s.fit,
           firstTs: s.firstTs,
           lastTs: s.lastTs,
+          cwd: s.cwd,
+          title: sessionTitle(s),
+          bytes: s.bytes,
         }));
         return sendJson(list);
       }
@@ -279,18 +324,17 @@ export class CtxServer {
         }
 
         const resData = await pruneSession({ sid, tuids, note }, model);
-        // Refresh model in background so new session is indexed
-        setTimeout(() => this.ensureModel(true), 100);
+        this.ensureModel(true);
         return sendJson(resData);
       }
 
       if (pathname === '/api/revert' && method === 'POST') {
         const body = await readBody();
-        const { forkSid } = body;
+        const { forkSid, force } = body;
         if (!forkSid) return sendJson({ error: 'forkSid is required' }, 400);
 
-        const resData = revertFork(forkSid);
-        setTimeout(() => this.ensureModel(true), 100);
+        const resData = revertFork(forkSid, { force: force === true });
+        this.ensureModel(true);
         return sendJson(resData);
       }
 
@@ -301,7 +345,7 @@ export class CtxServer {
           const ctxData = getSessionContext(sid, model);
           return sendJson(ctxData);
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
       }
 
@@ -313,10 +357,10 @@ export class CtxServer {
         }
         try {
           const resData = await saveEditedSessionContext({ sid, edits, note }, model);
-          setTimeout(() => this.ensureModel(true), 100);
+          this.ensureModel(true);
           return sendJson(resData);
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
       }
 
@@ -331,7 +375,7 @@ export class CtxServer {
           const validation = validateContinuity(ctxData.blocks, editMap);
           return sendJson(validation);
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
       }
 
@@ -350,7 +394,7 @@ export class CtxServer {
           const edits = synthesizeRegionMilestone(regionId, sid, model);
           return sendJson({ ok: true, edits });
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
       }
 
@@ -362,7 +406,7 @@ export class CtxServer {
           const sim = simulateResumedSession(sid, edits || [], model);
           return sendJson(sim);
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
       }
 
@@ -377,8 +421,52 @@ export class CtxServer {
           const healedText = autoHealBridgeText(block, text);
           return sendJson({ healedText });
         } catch (e) {
-          return sendJson({ error: e.message }, 500);
+          return sendError(e);
         }
+      }
+
+      // What a tree node stands for, in deletions that actually shrink the resume.
+      if (pathname === '/api/node-plan' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Pick a session: deleting works on one session at a time.' }, 400);
+        const q = (k) => parsedUrl.searchParams.get(k) || '';
+        return sendJson(nodePlan(model, sid, { cat: q('cat'), sub: q('sub'), leaf: q('leaf'), minTok: q('minTok') }));
+      }
+
+      // The whole session as one deletable tree (the main UI's single read).
+      if (pathname === '/api/map' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
+        return sendJson(contextMap(model, sid));
+      }
+
+      if (pathname === '/api/block' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
+        return sendJson(blockPreview(model, sid, parsedUrl.searchParams.get('id')));
+      }
+
+      if (pathname === '/api/boot' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
+        return sendJson(bootView(model, sid));
+      }
+
+      if (pathname === '/api/structure' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
+        return sendJson(structureView(model, sid));
+      }
+
+      // One verified fork for everything in the delete queue.
+      if (pathname === '/api/fork' && method === 'POST') {
+        const body = await readBody();
+        const { sid, edits, boot, structure, note, dryRun } = body;
+        if (!sid) return sendJson({ error: 'sid is required' }, 400);
+        if (![edits, boot, structure].every(x => x === undefined || Array.isArray(x))) return sendJson({ error: 'edits, boot and structure must be arrays' }, 400);
+        const resData = applySurgery(model, { sid, edits, boot, structure, note, dryRun: dryRun === true });
+        if (!resData.dryRun) this.ensureModel(true);
+        return sendJson(resData);
       }
 
       if (pathname === '/api/refresh' && method === 'POST') {
@@ -389,22 +477,28 @@ export class CtxServer {
       return sendJson({ error: 'Not found' }, 404);
     }
 
-    // Static files from UI directory
-    let filePath = path.join(UI_DIR, pathname === '/' ? 'index.html' : pathname);
-    if (!fs.existsSync(filePath)) {
-      filePath = path.join(UI_DIR, 'index.html');
-    }
+  }
+
+  serveStatic(pathname, res, security) {
+    let rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+    let filePath = path.resolve(UI_DIR, rel);
+    if (filePath !== UI_DIR && !filePath.startsWith(UI_DIR + path.sep)) filePath = path.join(UI_DIR, 'index.html');
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory() && fs.existsSync(path.join(filePath, 'index.html'))) filePath = path.join(filePath, 'index.html');
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) filePath = path.join(UI_DIR, 'index.html');
 
     const ext = path.extname(filePath).toLowerCase();
-    const contentType = MIME[ext] || 'application/octet-stream';
-
+    const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream', ...security };
+    if (ext === '.html') {
+      // Script only from this origin: even if some session text slipped past
+      // escaping into the DOM, injected <img onerror> or <script> cannot run.
+      headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    }
     fs.readFile(filePath, (err, content) => {
-      if (err) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('File not found');
-        return;
+      if (err) { res.writeHead(404, { 'Content-Type': 'text/plain', ...security }); res.end('File not found'); return; }
+      if (ext === '.html') {
+        content = Buffer.from(String(content).replace('<head>', `<head>\n  <meta name="ctxtree-token" content="${this.token}">`));
       }
-      res.writeHead(200, { 'Content-Type': contentType });
+      res.writeHead(200, headers);
       res.end(content);
     });
   }
