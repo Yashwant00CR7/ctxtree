@@ -1,289 +1,354 @@
 # ctxtree 🌳
 
-> **Context Surgeon & WizTree Visualizer for the LLM Context Window** — Edit paragraph contexts with surgical precision, eliminate continuity jumps, and reclaim wasted tokens across your Claude Code sessions.
+<p align="center">
+  <strong>WizTree for Claude's Context Window</strong><br>
+  Scan, visualize, and surgically delete token bloat across your Claude Code sessions with zero narrative jumps.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Yashwant00CR7/ctxtree/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg?style=flat-square" alt="Node >= 18"></a>
+  <img src="https://img.shields.io/badge/dependencies-0-success.svg?style=flat-square" alt="Zero External Dependencies">
+  <img src="https://img.shields.io/badge/Claude%20Code-Mod%20%7C%20Plugin-7C3AED.svg?style=flat-square" alt="Claude Code Mod">
+  <img src="https://img.shields.io/badge/tests-78%2F78%20passed-22C55E.svg?style=flat-square" alt="78/78 Tests Passed">
+  <img src="https://img.shields.io/badge/Continuity-Zero--Jump-0284C7.svg?style=flat-square" alt="Continuity Zero-Jump">
+</p>
+
+---
+
+<p align="center">
+  <img src="docs/walkthrough/img/web-01-overview.png" alt="ctxtree Web UI Overview - WizTree for Claude's Context Window" width="100%">
+</p>
+
+> [!TIP]
+> **Also available directly inside your terminal session!** Run `/ctxtree` within Claude Code to dock an interactive terminal map right beside your live chat transcript without leaving your workflow.
+
+---
+
+## Table of Contents
+
+- [The Core Purpose: Jump-Free Context Surgery](#the-core-purpose-jump-free-context-surgery)
+- [Two Ways to Use ctxtree](#two-ways-to-use-ctxtree)
+- [Interactive WizTree Treemap](#-interactive-wiztree-treemap)
+- [Task-Oriented Narrative](#-task-oriented-narrative)
+- [Surgical Deletion & Tombstones](#-surgical-deletion--tombstones)
+- [Live Inside Claude Code (The TUI Mod)](#-live-inside-claude-code-the-tui-mod)
+- [Architecture & Continuity Guard](#-architecture--continuity-guard)
+- [Deleting Boot Overhead](#-deleting-boot-overhead)
+- [Grey Content: What Resume Never Loads](#-grey-content-what-resume-never-loads)
+- [Instant Terminal CLI](#-instant-terminal-cli)
+- [Quick Start](#-quick-start)
+- [Keyboard Shortcuts](#-keyboard-shortcuts)
+- [Safety Invariants & Verification](#-safety-invariants--verification)
+- [Architecture & Repo Map](#-architecture--repo-map)
+- [License](#-license)
 
 ---
 
 ## The Core Purpose: Jump-Free Context Surgery
 
-Long LLM coding sessions accumulate massive amounts of token bloat: 50k file reads, repetitive command outputs, failed debugging rabbit holes, and redundant dialogue. 
+Long LLM coding sessions accumulate immense token bloat: 50k-token file reads, repetitive command logs, failed test suites, and obsolete debugging rabbit holes. 
 
-However, **blindly deleting or wiping chunks breaks the narrative flow ("creates jumps")**. In future turns or when resuming, the assistant gets confused, loses critical variable names or file structures, and either re-reads the entire file or asks repetitive questions.
+Standard compaction (`/compact`) is a blunt instrument: **it wipes out the fine-grained code structure, imports, and error stack traces**, leaving Claude disoriented and forced to re-read files or ask repetitive questions. Conversely, blindly deleting chunks breaks conversation continuity ("creates jumps"), triggering hallucinations and broken downstream references.
 
-**ctxtree solves this fundamentally**:
-- **See the Bloat**: WizTree-style interactive squarified treemap & lever tree showing where tokens are concentrated.
-- **Granular Paragraph Editor**: Click any card in the chronological narrative stream to edit user prompts, assistant reasoning, or tool outputs directly.
-- **Continuity Bridge Engine**: Automatically detects downstream references (e.g. `server.go` referenced in turn 24) and suggests bridges that keep those terms, so later turns still have what they refer to. (A keyword heuristic: it flags risk, it does not prove continuity.)
-- **Region Synthesizer**: Condense a 15-turn debugging detour into a single clean milestone.
-- **In-Place Fork & Resume**: Non-destructively forks the session with fast APFS copy-on-write clone (`cp -c -R`), outputting the exact `claude --resume <fork-uuid>` command.
-- **Delete anything WizTree-style**: right-click any node in the tree or rectangle in the treemap — tool results, MCP servers, skills, CLAUDE.md files, built-in tool schemas, system-prompt sections — queue it, and delete it all in one verified fork.
-- **Act on grey content**: content resume never loads can't be "deleted" for savings, so ctxtree offers what works on it: **uncompact** (bring the real history back in place of the lossy summary), **switch** to a rewind branch you left, or **slim** the fork.
+**`ctxtree` solves this fundamentally:**
+1. **Find the Culprits Instantly**: Interactive cushion-shaded squarified treemaps and lever trees expose exactly which file read or bash log is monopolizing your tokens.
+2. **Surgical Precision**: Drop stale tool results, shrink bloated inputs, or bridge prompt regions while leaving the rest of the conversation byte-for-byte identical.
+3. **Continuity Bridge Engine**: Automatically analyzes downstream turns for symbols, file paths, and identifiers, inserting safe narrative bridges so Claude never loses continuity.
+4. **Zero Risk**: Edits land in verified, non-destructive forks with instant copy-on-write transcript cloning (APFS `cp -c -R`). The parent session is never touched.
 
 ---
 
-## Features
+## Two Ways to Use ctxtree
 
-### 📖 1. Context Surgeon & Narrative Stream
-- **Paragraph-by-Paragraph Timeline**: Chronological narrative organized by genuine prompt regions.
-- **Inline Rich Editor**: Edit, rewrite, or trim any paragraph with a live token counter.
-- **🛡️ Continuity Guard**: Analyzes future turns to detect downstream references (symbols, file paths, variables). Flags anchors as `🟢 Safe`, `🟡 Anchor`, or `🔴 Critical Anchor` so you never accidentally break dialogue flow.
-- **🌉 Smart Continuity Bridges**:
-  - *File Reads*: Preserves imports, exports, and structure (`[Context Bridge: Inspected server.go (defines TripHandler, StartServer)...]`).
-  - *Bash Outputs*: Preserves command intent and clean result summary.
-  - *Code Condenser*: Keeps head and tail (15 lines each) while cleanly omitting the middle.
-- **✨ Milestone Synthesizer**: Collapse multi-step trial-and-error detours into a cohesive milestone turn.
+| Feature | ⚡ Live Inside Claude Code (TUI Mod) | 🌐 Outside (Web UI & CLI) |
+|---|---|---|
+| **Target** | Active running session in real-time | Any past or present session on disk |
+| **How Edits Land** | Conversation rebuilt in place or forked; keep working | Verified, non-destructive session fork |
+| **Interface** | Fullscreen terminal split-pane docked beside chat | Browser-based WizTree dashboard + terminal reports |
+| **Claude Collaboration** | Ask Claude to plan cleanups with you (`AskUserQuestion`) | Manual point-and-click or automated CLI flags |
+| **Special Powers** | Non-blocking background browsing while Claude generates | Boot overhead removal, uncompact, branch switcher, slim |
+| **Command** | `/ctxtree` | `npx ctxtree` |
 
-### 🌳 2. WizTree Visualizer & Treemap
-- **⚡ 1-Second Scanner**: Scans your entire Claude Code history (`~/.claude/projects/`, 150MB+ across 60+ sessions) in **under 1.0 second**.
+---
+
+## 🌳 Interactive WizTree Treemap
+
+`ctxtree` delivers the iconic **WizTree** experience for your LLM context window:
+
+<p align="center">
+  <img src="docs/walkthrough/img/web-03-by-type.png" alt="WizTree By-Type View showing 34k log file" width="49%">
+  <img src="docs/walkthrough/img/06-treemap-click.png" alt="Selecting Treemap Block in TUI" width="49%">
+</p>
+
+- **Squarified Cushion Treemap**: Blocks are proportional to token consumption. Category color-coding immediately separates Setup (blue), Tool Results (red/orange), Conversation (green), and Attachments.
 - **Dual Accounting**:
-  - **Distinct Size**: Raw tokens of a paragraph.
-  - **Allocated**: `Size × turns resident` — reveals how an early command multiplies its token cost across every subsequent turn.
-- **Interactive Treemap**: Squarified treemap with authentic WizTree 3D bevels, instant hover tooltips, and click-to-jump into the paragraph editor.
-- **Actionable Lever Tree**: Breaks context down by `boot overhead`, `tool results`, `conversation`, and `subagent contexts`.
-
-### ✂️ 3. Safe Forking & Lineage
-- **Verified before it exists**: every fork is checked against the invariants below in memory, written to a hidden temp file, read back, checked again, and only then renamed into place.
-- **APFS Clone**: Clones `~/.claude/file-history` copy-on-write (~100ms, near-zero extra disk) so undo still works inside the fork.
-- **Lineage Manifest**: Tracks all parent-child forks in `~/.claude/ctxtree/lineage.jsonl` with revert capability.
+  - **Distinct Size**: Raw token footprint of an individual paragraph or output.
+  - **Allocated Tokens**: `Distinct Tokens × Turns Resident`. Reveals how an early 10k-token read quietly multiplied into 300k+ billed tokens over 30 conversation turns.
+- **Instant Hit Testing**: Click any rectangle in either the Web UI or the terminal TUI to instantly highlight its corresponding row in the tree, view full block metadata, and inspect the raw text preview.
 
 ---
 
-## Deleting boot overhead
+## 📖 Task-Oriented Narrative
 
-MCP tool schemas, MCP server instructions, the skill and agent listings, CLAUDE.md
-files and the system prompt look like config that Claude Code re-injects on every
-launch. On current Claude Code (verified on 2.1.283) they are not: they are written
-into the transcript, and a resume replays them.
+Rather than scrolling through raw message arrays, `ctxtree` groups your context into high-level user tasks—the actual requests you typed:
 
-- Each is an `attachment` record on the conversation chain. Its `rendered` field is
-  the exact text sent; resume sends it verbatim (without it, the text is rebuilt from
-  `attachment`). The system prompt is the latest `prompt_snapshot`, sent as-is until
-  the session compacts again.
-- On resume Claude Code diffs what the transcript says was announced against what is
-  configured, and appends the difference. Deleting an announcement alone therefore
-  just gets it re-announced at the end.
-- That diff is **by name** for MCP instructions, skills and agents: ctxtree keeps the
-  name, drops the text, and nothing is re-announced — no config change at all.
-- It is **by content** for CLAUDE.md, and tools come from the live tool pool. For
-  those, the fork gets a **launch profile**: a `--settings` overlay with
-  `claudeMdExcludes`, `autoMemoryEnabled: false`, `skillOverrides` and
-  `permissions.deny` (a bare-name deny removes a tool — inline schema or deferred
-  name — from the request). Your settings files are never edited.
+<p align="center">
+  <img src="docs/walkthrough/img/03-by-task.png" alt="Task-Oriented Narrative View" width="80%">
+</p>
 
-So a fork that removed boot overhead must be resumed with its profile:
+### Intelligent Stale Detection
+- **`[out of date]` Flags**: When a file read in Turn 3 is edited in Turn 14, `ctxtree` flags the Turn 3 read as stale. Dropping it is 100% safe because Claude already has the newer state.
+- **`[not mentioned since]` Signals**: Detects files or tools that were touched during an early investigation and never referenced again.
+- **Failed Steps Highlighted in Red**: Readily spot failed test runs and error traces that have already been resolved.
 
-```bash
-npx ctxtree resume <fork-id-prefix>
-# = cd <project> && claude --resume <fork> --settings ~/.claude/ctxtree/profiles/<fork>.json
+---
+
+## ✂️ Surgical Deletion & Tombstones
+
+When cleaning a session, `ctxtree` offers three distinct, non-destructive editing operations:
+
+<p align="center">
+  <img src="docs/walkthrough/img/web-08-marked.png" alt="Items Marked for Deletion with Hatching" width="49%">
+  <img src="docs/walkthrough/img/16-applied.png" alt="Surgical Deletion Applied" width="49%">
+</p>
+
+### 1. Drop (Smart Tombstone)
+Replaces voluminous tool outputs with an informative tombstone. Claude knows the command was run, but doesn't waste 30k tokens carrying the raw text:
+```text
+[ctxtree: removed Read result for /acme-api/logs/server.log (~34,529 tokens) to reclaim context. Re-run it if you need it again.]
 ```
 
-Without the profile nothing breaks, but Claude Code re-announces what was removed.
+### 2. Shrink
+Condenses massive tool inputs (e.g. huge file write payloads) down to the first line and a concise byte/line count note. The `tool_use` and `tool_result` pair remains completely intact.
 
-| Removed item | In the fork's transcript | Launch profile | Lasts |
-|---|---|---|---|
-| MCP server | instructions text dropped (name kept); tool names/schemas dropped | `permissions.deny: ["mcp__<server>"]` | tools: every launch via the profile; instructions: until the fork compacts |
-| Built-in tool | dropped from the recorded tool list | `permissions.deny: ["<Tool>"]` | every launch via the profile |
-| Skill | listing line dropped (name kept) | `skillOverrides: {name: "user-invocable-only"}` (you can still run `/name`) | every launch; plugin skills until the fork compacts |
-| CLAUDE.md | file dropped from the instructions record | `claudeMdExcludes: [path]` | every launch via the profile |
-| Auto memory (MEMORY.md) | dropped | `autoMemoryEnabled: false` | every launch via the profile |
-| Agent listing entry | line dropped (type kept) | — | until the fork compacts |
-| System prompt section | dropped from the latest `prompt_snapshot` | — | until the fork compacts |
+### 3. Continuity Bridge
+Drafts a concise contextual bridge preserving key symbols, variable names, and architectural decisions identified by the Continuity Guard:
 
-claude.ai connectors and plugin MCP servers are removed the same way (deny rules work
-for any server). Managed (policy) instructions cannot be excluded and are shown as such.
-
-## Grey content: what resume never loads
-
-Content before the last compaction, on a rewind branch you left, or a stray result of
-an interrupted call costs **0 tokens** on resume, so deleting it saves nothing. What
-you can do with it:
-
-- **Uncompact** — drop the compaction boundary and its lossy summary, continue the
-  conversation from the last pre-compaction message, and drop the boot overhead
-  Claude Code re-announced after compacting (it is already announced in the restored
-  history). The context grows, so queue tombstones for the restored history's heavy
-  results in the same fork: a surgical compaction instead of a lossy one.
-- **Switch branch** — make a rewind branch you left the resumed one; the branch you
-  were on stays in the parent session.
-- **Slim** — drop every record resume never loads. The resumed request is
-  byte-identical; the file is smaller and parses faster.
-
-## The interface
-
-`ctxtree` opens one session at a time, laid out like WizTree, organised two ways:
-
-- **By task** (the default): one folder per thing you asked for, oldest first, named
-  with your own words and holding everything Claude did for it. A tool call and its
-  result are one item in plain words ("Read src/app.js", "Ran npm test", "Wrote
-  ui/style.css"). Each task shows when it was, the files it touched, how it ended
-  (Claude's last reply), and two signals for "do I still need this?":
-  - **out of date**: an item a later turn replaced (the file was read again or
-    changed, or the same command ran again). Deleting these costs nothing.
-  - **not mentioned since**: nothing after the task names the files it worked on.
-
-  Right-click a task: *Clear its tool output* (keeps what you asked and what Claude
-  answered, so Claude still knows it happened) or *Delete the whole task*.
-  Right-click the root: *Clear tool output of older tasks — keep last 1 / 2 / 3 / 5 / 10*,
-  or *Delete every out-of-date copy*.
-- **By type**: the same context by kind.
-
-Both views share the same marks.
-
-- **Tree** (top left): in the type view, the resumed context as folders — *Setup* (system prompt,
-  built-in tools, MCP servers, skills, agents, CLAUDE.md), *Tool results* (by tool,
-  then by file or command, then each run), *Conversation* (your messages, Claude's
-  replies, tool calls) and *Other attachments*. Columns: % of parent, tokens,
-  items, last turn. Sort by any column. A second, grey tree holds what resume
-  never loads (before a compaction, rewound branches, interrupted calls).
-- **Types** (top right): the same context by kind, like WizTree's extension list.
-  Click one to light up its rectangles in the map.
-- **Details** (right): what the selection is, what deleting it does, how long the
-  removal lasts, and the first 6,000 characters of the content.
-- **Treemap** (bottom): squarified, cushion-shaded, one rectangle per item, with
-  a labelled band for every group that fits one.
-
-**Deleting.** Right-click anything in the tree, the type list or the map, or select
-it and press <kbd>⌫</kbd>. A group offers *Delete all*, *Delete only the larger
-ones* (≥ 1k / 2.5k / 5k / 10k …) and *Delete older copies, keep the latest* (files
-that were read again, commands that ran again). Marked items are struck through
-and hatched; the meter shows before → after. <kbd>⌘Z</kbd> undoes.
-**Review deletion** builds the whole fork in memory and verifies it before you
-commit; **Create fork** writes it and gives you the resume command.
-Grey groups offer *Restore into context (uncompact)*, *Switch to this branch* and
-*Remove from the fork's file* instead of a delete that would save nothing.
-
-What each leaf deletes:
-
-| Item | What happens in the fork |
-|---|---|
-| Tool result | Replaced by a one-line note; the call stays, so Claude knows it ran |
-| Tool call | Long strings in its input (file contents written, edit text) cut to their first line and a note; the call and its pairing stay |
-| Your message / Claude's reply / image | Replaced by a one-line note |
-| Setup item | Removed from the transcript, plus a launch profile where Claude Code would load it again |
-
-Token counts are anchored to Claude Code's own measurement: the last reply on the
-resumed chain records the exact size of the request (input + cache read + cache
-write), and the per-item estimates are scaled to it. Only the split is estimated.
-
-The previous interface (paragraph editor, bridges, continuity checks) is still at
-`/classic/`.
+<p align="center">
+  <img src="docs/walkthrough/img/13-bridge-drafted.png" alt="Drafted Continuity Bridge" width="70%">
+</p>
 
 ---
 
-## Quick Start
+## ⚡ Live Inside Claude Code (The TUI Mod)
 
-Run directly via `npx` or Node.js (requires Node 18+ with zero external dependencies):
+Use `ctxtree` without ever leaving your terminal! The native Claude Code mod docks an interactive split-pane directly inside Claude Code:
 
+<p align="center">
+  <img src="docs/walkthrough/img/02-overview.png" alt="Live ctxtree TUI Mod Docked in Claude Code" width="49%">
+  <img src="docs/walkthrough/img/21-claude-stages.png" alt="Claude Collaboratively Staging a Cleanup" width="49%">
+</p>
+
+### Features of the TUI Mod
+- **Fullscreen Docked Layout**: Opens alongside your chat via `/ctxtree` (works with `/tui fullscreen`).
+- **Non-Blocking Operation**: Browse, mark, and inspect context while Claude is actively thinking or writing code.
+- **Claude Stages, You Apply**: Ask Claude naturally: *"Free up some context by dropping stale test runs."* Claude uses the internal `mcp__ctxtree__map` and `mcp__ctxtree__stage` tools to formulate a plan. **Only you can press `a` (Apply)**—the model cannot execute deletions autonomously.
+- **Proactive Context Gauge**: A live status-line meter informs you when context utilization crosses critical thresholds.
+
+---
+
+## 🛡️ Architecture & Continuity Guard
+
+`ctxtree` is engineered with extreme paranoia around transcript integrity:
+
+<p align="center">
+  <img src="docs/walkthrough/img/diagram-architecture.png" alt="ctxtree System Architecture" width="85%">
+</p>
+
+### How Forks Stay Safe
+1. **Verification Before Disk**: Every fork is verified in-memory across 8 strict invariants before any bytes touch disk.
+2. **Atomic Write**: The new transcript is written to a hidden temporary file, re-read and validated, and then atomically renamed into place.
+3. **APFS Copy-on-Write**: File history (`~/.claude/file-history`) is cloned copy-on-write in ~100ms with near-zero disk usage. Undo (`/undo`) continues to work flawlessly in the forked session.
+4. **Lineage Tracking**: Parent-child lineage is logged in `~/.claude/ctxtree/lineage.jsonl`. You can safely revert or backtrack at any time.
+
+<p align="center">
+  <img src="docs/walkthrough/img/diagram-apply.png" alt="Transcript Apply Diagram" width="70%">
+</p>
+
+---
+
+## 📦 Deleting Boot Overhead
+
+MCP schemas, MCP instructions, skill listings, CLAUDE.md files, and system prompts are recorded into transcripts and replayed on resume. `ctxtree` can surgically eliminate them:
+
+| Overhead Item | In the Fork's Transcript | Launch Profile Overlay | Persistence |
+|---|---|---|---|
+| **MCP Server** | Instructions dropped; names kept | `permissions.deny: ["mcp__<server>"]` | Until fork compacts |
+| **Built-in Tool** | Dropped from recorded tool list | `permissions.deny: ["<Tool>"]` | Permanent via profile |
+| **Skill Listing** | Line dropped; name retained | `skillOverrides: {name: "user-invocable-only"}` | Permanent via profile |
+| **CLAUDE.md** | Dropped from instructions record | `claudeMdExcludes: [path]` | Permanent via profile |
+| **Auto-Memory** | `MEMORY.md` dropped | `autoMemoryEnabled: false` | Permanent via profile |
+| **System Prompt** | Section trimmed from `prompt_snapshot` | — | Until fork compacts |
+
+Resume the fork using its generated profile:
 ```bash
-# Start local server and launch Context Surgeon & WizTree UI
+npx ctxtree resume <fork-prefix>
+```
+
+---
+
+## 🌫️ Grey Content: What Resume Never Loads
+
+Content before the last compaction or on an abandoned rewind branch costs **0 tokens** on resume. Deleting it saves nothing, but `ctxtree` lets you operate on it:
+
+- **Uncompact**: Strip away the lossy compaction summary, restore genuine message history, and apply surgical tombstones in the same fork.
+- **Switch Branch**: Seamlessly jump to an abandoned rewind branch while preserving the current branch in the parent session.
+- **Slim**: Remove unreferenced orphan records to speed up transcript parsing while preserving identical resume semantics.
+
+---
+
+## 💻 Instant Terminal CLI
+
+Auditing your context window requires zero setup:
+
+<p align="center">
+  <img src="docs/walkthrough/img/cli-01-scan.png" alt="Fast CLI Scan" width="49%">
+  <img src="docs/walkthrough/img/cli-02-boot.png" alt="CLI Boot Overhead Inspection" width="49%">
+</p>
+
+- **Sub-Second Global Scan**: Scans 60+ projects and 150MB+ of transcript data in **under 1.0 second**.
+- **CLI Commands**:
+  ```bash
+  # Launch the interactive Web UI
+  npx ctxtree
+
+  # Fast summary of all sessions across projects
+  npx ctxtree --cli
+
+  # Audit boot overhead for a session
+  npx ctxtree --boot <session-id-prefix>
+
+  # Inspect paragraphs, prompt regions, and continuity anchors
+  npx ctxtree --context <session-id-prefix>
+
+  # Automatically bridge heavy tool outputs (dry run)
+  npx ctxtree --bridge <session-id-prefix> --threshold 2500 --dry-run
+  ```
+
+---
+
+## 🚀 Quick Start
+
+### Option A: Use the Web UI & CLI (Zero Dependencies)
+Requires **Node.js >= 18**:
+```bash
+# Run immediately via npx
 npx ctxtree
 
-# Audit paragraphs, prompt regions, and continuity anchors for a session in terminal
-npx ctxtree --context [session-id]
-
-# Bridge heavy tool output into a fork (session id or unique prefix required)
-npx ctxtree --bridge <sid-prefix> [--threshold 2500] [--dry-run]
-
-# Terminal overview of all sessions
-npx ctxtree --cli
-
-# What boot overhead a session resumes with, and what is outside its context
-npx ctxtree --boot <sid-prefix>
-
-# Resume a fork with its launch profile
-npx ctxtree resume <fork-id-prefix>
-
-# Custom port
-npx ctxtree --port 4000 --no-open
+# Or clone and start locally
+git clone git@github-personal:Yashwant00CR7/ctxtree.git
+cd ctxtree
+npm start
 ```
-
 Then open `http://localhost:3888` in your browser.
 
+### Option B: Install the Claude Code Mod
+```bash
+# Method 1: Load directly from local directory
+claude --plugin-dir plugins/ctxtree --plugin-dir plugins/ctxtree-ui
+
+# Method 2: Install via plugin marketplace
+claude plugin marketplace add /path/to/ctxtree
+claude plugin install ctxtree@ctxtree
+claude plugin install ctxtree-ui@ctxtree
+```
+Inside Claude Code:
+1. Ensure fullscreen layout: `/tui fullscreen`
+2. Open the ctxtree pane: `/ctxtree`
+
 ---
 
-## Resuming a Cleaned Session
+## ⌨️ Keyboard Shortcuts
 
-Once you edit or bridge paragraphs in the UI, click **"🚀 Fork Session Without Jumps"**. `ctxtree` forks the session and provides the exact resume command:
+### TUI Mod (Inside Claude Code)
+| Key | Action |
+|---|---|
+| `/ctxtree` | Open or close the docked ctxtree pane |
+| `↑` `↓` `PgUp` `PgDn` | Navigate through tasks and blocks |
+| `l` / `h` | Expand / collapse tree folders |
+| `x` or `Space` | Mark / unmark selected block for deletion |
+| `d` / Right-Click | Context menu: drop, shrink, or keep |
+| `1` / `2` | Switch view: **By Task** / **By Type** |
+| `t` · `i` · `k` | Switch side-panel: **Types** · **Details** · **Keys** |
+| `f` / `s` / `u` | Filter text / Cycle sort / Undo |
+| `r` | Open deletion review dialog |
+| `a` | **Apply**: Write verified fork & resume |
+| `Esc` | Return focus to Claude Code prompt |
 
-```bash
-claude --resume <fork-session-uuid>
-```
-
-The fork continues from the same point with your edits in place. The parent session is never modified. Run the command from the project directory: a resumed conversation runs its tools wherever you launch it. If the fork removed boot overhead, the command includes `--settings <profile>` — use it (or `npx ctxtree resume <fork>`) every time you resume that fork.
+### Web UI
+| Key | Action |
+|---|---|
+| `Click` | Select node in tree or rectangle in treemap |
+| `Right-Click` | Open surgery menu (Drop, Shrink, Keep latest, etc.) |
+| `⌫` or `Delete` | Mark / unmark selected item |
+| `⌘Z` / `Ctrl+Z` | Undo last marking |
+| `⌘F` / `Ctrl+F` | Focus filter input |
 
 ---
 
-## How forks stay safe
+## 🔒 Safety Invariants & Verification
 
-ctxtree only ever writes **new** files. A fork is a copy of the parent transcript under a new session id, built in two layers that are each verified before anything is written.
+Before any fork is written, `ctxtree` validates all of the following invariants:
+- **Chain Consistency**: Turn alternation (`user` ⇄ `assistant`) is strictly preserved; no orphan parent references.
+- **Tool Pairing**: Every `tool_use` is guaranteed to pair with its exact `tool_result` by ID.
+- **Locked Thinking**: Claude's signed reasoning/thinking blocks are never tampered with or modified.
+- **Input Validity**: All `tool_use` payloads remain strictly valid JSON objects.
+- **Local Sandbox Security**: The web server binds strictly to `127.0.0.1`, validates `Host: localhost`, enforces script-locking Content Security Policy (CSP), and requires a per-process authentication token.
 
-**Structure** (uncompact, switch, slim) may drop records and re-chain what follows them. It must leave every kept record identical except a planned `parentUuid`, in original order, with no parent pointing at a dropped record, tool calls still paired on the resumed chain, and the expected leaf and resumed chain (slim: the resumed chain and its content exactly unchanged).
-
-**Content** (edits, tombstones, boot removals) then rewrites blocks and attachment records. Before the fork is renamed into place it must pass:
-
-- same number of records, in the same order; `uuid` / `parentUuid` chain untouched; every record not edited reproduced exactly
-- a boot removal touches only a record's `attachment` / `rendered`, the removed text is gone from what is sent, and the item no longer appears in the fork's boot inventory
-- same resume leaf and same resumed chain
-- identical `tool_use` ids and `tool_result` pairing
-- every record that carried the parent's session id re-stamped (ids inherited from earlier resumes are kept, as Claude Code does)
-- every edit landed exactly where it was addressed; every **unedited** block byte-identical
-- no empty text blocks, and every `tool_use` input still a JSON object
-
-Edits are addressed by record `uuid` and carry a fingerprint of the text you saw, so an edit can never land on a different message, and a block that changed after you loaded it is refused rather than overwritten.
-
-**What "in context" means.** `claude --resume` loads the chain from the newest message back to the last compaction. Content before a compaction, or on a branch you rewound away from, is not loaded — across a typical history that is more than half of all transcript content. ctxtree hides it by default ("Outside resumed context" filter) and reports savings only for what resume actually loads. Three details, each checked by resuming a real session against a recording API stand-in: a compaction's *preserved segment* (its last turn kept verbatim) is spliced in after the summary; results of *parallel tool calls*, which hang off the chain beside their call, are merged back into the turn; and the records written after the last message (the latest `prompt_snapshot`) are loaded too.
-
-**Locked blocks.** Signed thinking blocks are never rewritten: finished-turn thinking is dropped from what the API sees (so editing it saves nothing), and a session that stopped mid tool-call needs its latest thinking block unchanged.
-
-**Revert** deletes only files ctxtree created, and refuses to delete a fork you have resumed and kept working in unless you force it.
-
-**The local server** listens on `127.0.0.1` only, answers only to `localhost` Host headers, sends no CORS headers, requires a per-process token that is embedded in the page it serves, and locks scripts to its own origin with a Content-Security-Policy.
-
+### Running the Test Suite
 ```bash
-npm test               # engine + server security tests (sandboxed; never touches ~/.claude)
-npm run verify:real    # build & verify edits, boot removals, uncompact, switch and slim on every real session; dry run, writes nothing
-npm run verify:cc      # end-to-end against the real `claude` CLI: builds forks, resumes them with `claude -p`,
-                       # and checks the exact request Claude Code sends (local API stand-in, throwaway config dir, no API credit)
-npx ctxtree --bridge <sid-prefix> --dry-run   # see what a bridge would do, write nothing
+# Run unit & security test suite (78 tests, ~1s)
+npm test
+
+# Verify dry runs on real local sessions without writing to disk
+npm run verify:real
+
+# End-to-end integration test against real Claude Code CLI (sandboxed API)
+npm run verify:cc
+
+# End-to-end headless TUI tests
+npm run verify:tui
 ```
 
-`verify:cc` is the one to re-run after a Claude Code update: every boot-removal and
-structural rule above has a check there, so a change in how Claude Code records or
-replays context shows up as a failing line rather than a silent regression.
+---
 
-## Architecture
+## 🏗️ Architecture & Repo Map
 
 ```text
 ctxtree/
 ├── bin/
-│   └── ctxtree.js        # CLI launcher, terminal reports, and context auditor
+│   └── ctxtree.js          # CLI launcher, terminal reports, and scanner
 ├── src/
-│   ├── session.js        # One transcript parser: addresses, resumed chain, locks, grey-content kinds
-│   ├── fork.js           # The only writer: structure + content layers, verify, atomic write, revert
-│   ├── boot.js           # Boot inventory, attachment surgery, launch profiles
-│   ├── restructure.js    # Uncompact, branch switch, slim
-│   ├── map.js            # The session as one deletable tree; token anchoring; block preview
-│   ├── surgery.js        # Tree node -> deletions; the one fork call the UI uses
-│   ├── sessionEditor.js  # Editor view, continuity heuristics & bridge generator
-│   ├── paths.js          # Claude directory paths & slug resolvers
-│   ├── attach.js         # Attachment parser (MCP schemas, system prompt, skills)
-│   ├── tokens.js         # Multivariate calibration engine
-│   ├── scan.js           # Fast streaming JSONL parser
-│   ├── model.js          # Ground-truth anchored session model
-│   ├── tree.js           # Lever tree & project breakdown builder
-│   ├── regions.js        # Verbatim prompt region boundary detector
-│   ├── findings.js       # Two-tier reclaim rule engine
-│   ├── prune.js          # Tombstone by tool_use_id (via fork.js)
-│   └── server.js         # Zero-dependency HTTP server & REST API
-└── ui/
-    ├── index.html        # Tree, types, details and treemap
-    ├── style.css         # Light and dark themes
-    ├── app.js            # Virtualised tree, cushion treemap, delete marks, review drawer
-    └── classic/          # The previous interface (paragraph editor and bridges)
+│   ├── session.js          # Shared transcript parser: chains, grey-content, addresses
+│   ├── fork.js             # Atomic fork writer, invariant verification, rollback
+│   ├── boot.js             # Boot overhead analysis, attachment surgery, profiles
+│   ├── restructure.js      # Structural operations: uncompact, branch switch, slim
+│   ├── map.js              # Deletable context tree model & token anchoring
+│   ├── surgery.js          # Node-to-deletion translation layer
+│   ├── sessionEditor.js    # Continuity heuristics & bridge synthesis
+│   ├── server.js           # Zero-dependency loopback HTTP server & REST API
+│   ├── scan.js             # Sub-second streaming JSONL parser
+│   ├── model.js            # Ground-truth anchored session model
+│   └── tokens.js           # Multi-tier token estimation & calibration
+├── ui/
+│   ├── index.html          # WizTree interface (Tree, Types, Details, Treemap)
+│   ├── style.css           # High-contrast light & dark themes
+│   └── app.js              # Virtualized tree, cushion treemap renderer, delete review
+├── plugins/
+│   ├── ctxtree/            # Claude Code Mod Core: live map, planning tools, fork engine
+│   │   └── core/           # Runtime-agnostic shared core (runs in Node & Claude Mod)
+│   └── ctxtree-ui/         # Claude Code Mod UI: docked pane, treemap overlay, review
+├── docs/
+│   ├── walkthrough.md      # Comprehensive illustrated walkthrough
+│   ├── mod-spec.md         # Architecture specification for Claude Code Mod
+│   ├── tui-design.md       # Terminal UI design decisions
+│   └── walkthrough/img/    # Complete high-resolution visual assets
+└── test/                   # Comprehensive 78-test suite with zero regressions
 ```
 
 ---
 
-## License
+## 📜 License
 
-MIT © Yashwant00CR7
+MIT © [Yashwant00CR7](https://github.com/Yashwant00CR7)

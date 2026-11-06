@@ -44,7 +44,7 @@
   </header>
 
   <main id="main">
-    <section class="upper" id="upper">
+    <section class="left" id="left">
       <div class="pane tree-pane" id="tree-pane">
         <div class="thead" id="thead">
           <button class="th c-name" data-sort="name">Name</button>
@@ -52,48 +52,54 @@
           <button class="th c-tok" data-sort="tok">Tokens</button>
           <button class="th c-n" data-sort="n">Items</button>
           <button class="th c-turn" data-sort="turn">Turn</button>
+          <span class="th c-x" aria-hidden="true"></span>
         </div>
         <div class="tbody" id="tree" tabindex="0" role="tree" aria-label="Context tree">
           <div class="spacer-rows" id="tree-spacer"></div>
         </div>
       </div>
 
-      <div class="splitter v" id="split-v" role="separator" aria-orientation="vertical"></div>
+      <div class="splitter h" id="split-h" role="separator" aria-orientation="horizontal"></div>
 
-      <div class="pane side-pane" id="side-pane">
-        <div class="types">
-          <div class="thead">
-            <span class="th c-type">Type</span>
-            <span class="th c-pct">Percent</span>
-            <span class="th c-tok">Tokens</span>
-            <span class="th c-n">Items</span>
-          </div>
-          <div class="types-body" id="types"></div>
+      <section class="map-pane" id="map-pane">
+        <div class="map-bar">
+          <span id="map-path" class="map-path"></span>
+          <span class="map-hint">✕ or <kbd>⌫</kbd> marks for deletion · Right-click for more · Double-click to open</span>
         </div>
-        <div class="details" id="details">
-          <div class="empty">Select anything to see what it is.</div>
+        <div class="map-wrap" id="map-wrap">
+          <canvas id="map"></canvas>
+          <canvas id="map-over"></canvas>
+          <div id="tip" class="tip hidden"></div>
         </div>
-      </div>
+      </section>
     </section>
 
-    <div class="splitter h" id="split-h" role="separator" aria-orientation="horizontal"></div>
+    <div class="splitter v" id="split-v" role="separator" aria-orientation="vertical"></div>
 
-    <section class="map-pane" id="map-pane">
-      <div class="map-bar">
-        <span id="map-path" class="map-path"></span>
-        <span class="map-hint">Right-click to delete <kbd>⌫</kbd> · Double-click to open</span>
+    <div class="pane side-pane" id="side-pane">
+      <div class="side-tabs" role="tablist" aria-label="Side panel">
+        <button data-tab="details" role="tab" title="What the selection is and what it says (i)">Details</button>
+        <button data-tab="types" role="tab" title="Tokens by type, like WizTree's extension list (t)">Types</button>
       </div>
-      <div class="map-wrap" id="map-wrap">
-        <canvas id="map"></canvas>
-        <canvas id="map-over"></canvas>
-        <div id="tip" class="tip hidden"></div>
+      <div class="types" id="types-panel" role="tabpanel">
+        <div class="thead">
+          <span class="th c-type">Type</span>
+          <span class="th c-pct">Percent</span>
+          <span class="th c-tok">Tokens</span>
+          <span class="th c-n">Items</span>
+        </div>
+        <div class="types-body" id="types"></div>
       </div>
-    </section>
+      <div class="details" id="details" role="tabpanel">
+        <div class="empty">Select anything to see what it is.</div>
+      </div>
+    </div>
   </main>
 
   <footer class="status">
     <span id="status-sel" class="status-sel"></span>
     <span class="spacer"></span>
+    <button id="btn-reload" class="ghost small changed hidden" title="This session changed since you opened it">Session changed · Reload</button>
     <span id="status-marked" class="status-marked"></span>
     <button id="btn-undo" class="ghost small" title="Undo (⌘Z)" disabled>Undo</button>
     <button id="btn-review" class="primary" disabled>Review deletion</button>

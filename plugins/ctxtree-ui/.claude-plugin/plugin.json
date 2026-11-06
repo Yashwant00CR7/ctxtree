@@ -1,0 +1,12 @@
+{
+  "name": "ctxtree-ui",
+  "version": "0.1.0",
+  "description": "The ctxtree pane in the terminal: tree, types, details and a cushion treemap of the context window; mark, review and apply. Needs the ctxtree plugin.",
+  "author": {
+    "name": "Yashwant00CR7"
+  },
+  "types": "./types/index.d.ts",
+  "dependencies": [
+    "ctxtree"
+  ]
+}

@@ -376,16 +376,31 @@ function scanAgent({ agent, type = 'subagent', file }, startIdx) {
            chunks, samples, nextIdx: idx };
 }
 
+// A session file and its subagents, as they are on disk: when this is unchanged,
+// so is the scan. Lets a rescan read only what grew.
+const scanned = new Map();   // file -> { sig, r }
+function signature(f) {
+  const st = (p) => { try { const x = fs.statSync(p); return `${x.size}:${x.mtimeMs}`; } catch { return '-'; } };
+  return [st(f.file), ...f.subagents.map(a => st(a.file))].join('|');
+}
+
 export function scanAll(root = PROJECTS_DIR) {
   const t0 = Date.now();
   const files = listSessionFiles(root);
   const sessions = [], allSamples = [], byId = new Map();
+  const seen = new Set();
+  let rescanned = 0;
   for (const f of files) {
-    const r = scanSession(f);
+    seen.add(f.file);
+    const sig = signature(f);
+    const hit = scanned.get(f.file);
+    const r = hit && hit.sig === sig ? hit.r : (rescanned++, scanSession(f));
+    if (r && !(hit && hit.r === r)) scanned.set(f.file, { sig, r });
     if (!r) continue;
     sessions.push(r.session);
     byId.set(r.session.sid, r);
     for (const s of r.samples) allSamples.push(s);
   }
-  return { sessions, byId, samples: allSamples, ms: Date.now() - t0, nFiles: files.length };
+  for (const k of scanned.keys()) if (!seen.has(k)) scanned.delete(k);
+  return { sessions, byId, samples: allSamples, ms: Date.now() - t0, nFiles: files.length, rescanned };
 }

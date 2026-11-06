@@ -71,23 +71,45 @@ for (const [k, [n, good]] of Object.entries(ops)) console.log(`${k.padEnd(10)} a
 if (refused.length) console.log(`refused as expected (${refused.length}):\n  ${refused.slice(0, 8).join('\n  ')}`);
 for (const b of broken) console.log(' ', JSON.stringify(b));
 
-// What the UI offers: mark EVERY deletable leaf of the map (each tool result,
-// shrinkable call, message, image and setup item) and build the fork. If the
-// map ever offers something the engine cannot verify, this fails.
+// What the UI offers, hard deletes: every task alone, a sample of tool steps
+// alone, and everything but the latest task at once (with every image, setup
+// item and attachment). If the map ever offers something the engine cannot
+// verify, this fails. Refusals the engine explains are counted, not failed.
 const { build } = await import('../src/model.js');
 const { contextMap } = await import('../src/map.js');
 const { applySurgery } = await import('../src/surgery.js');
 const model = build();
-let mapOk = 0, mapFail = 0, mapItems = 0;
+const tally = { task: [0, 0], step: [0, 0], 'all but latest': [0, 0] };
+const DROP_REFUSAL = /back to back|nothing would be left/;
+const dropRefused = [];
+const attempt = (name, sid, opts) => {
+  tally[name][0]++;
+  try { applySurgery(model, { sid, dryRun: true, ...opts }); tally[name][1]++; }
+  catch (e) {
+    const probs = (e.problems || []).map(x => x.error);
+    if (probs.length && probs.every(p => DROP_REFUSAL.test(p))) { tally[name][0]--; dropRefused.push(`${sid.slice(0, 8)} ${name}: ${probs[0]}`); return; }
+    broken.push({ sid: sid.slice(0, 8), name: `map: ${name}`, error: e.message, problems: probs.slice(0, 3) });
+  }
+};
 for (const s of model.sessions) {
-  const m = contextMap(model, s.sid);
-  const edits = [], boot = [];
-  const walk = (n) => { if (n.kids) return n.kids.forEach(walk); for (const a of n.acts) { if (a.k === 'block') edits.push({ id: a.id, fp: a.fp, op: a.op || 'tombstone' }); else boot.push(a.id); } };
+  let m;
+  try { m = contextMap(model, s.sid); } catch { continue; }   // gone since the scan
+  const tasks = m.tasks.kids.filter(k => k.t === 'task');
+  const keysOf = (n) => { const out = new Set(); const w = (x) => { if (x.kids) return x.kids.forEach(w); for (const a of x.acts) if (a.k === 'drop') out.add(a.id); }; w(n); return [...out]; };
+  for (const t of tasks.slice(-20)) { const k = keysOf(t); if (k.length) attempt('task', s.sid, { drop: k }); }
+  const steps = [...m.units.keys()].filter(k => k.startsWith('step:'));
+  for (const k of steps.filter((_, i) => i % Math.max(1, Math.ceil(steps.length / 30)) === 0)) attempt('step', s.sid, { drop: [k] });
+  const latest = tasks.find(t => t.latest);
+  const drop = new Set(), edits = [], boot = [];
+  const walk = (n) => {
+    if (n === latest) return;
+    if (n.kids) return n.kids.forEach(walk);
+    for (const a of n.acts) { if (a.k === 'drop') drop.add(a.id); else if (a.k === 'img') edits.push({ id: a.id, fp: a.fp, op: 'remove' }); else if (a.k === 'boot') boot.push(a.id); }
+  };
   walk(m.tasks);
-  if (!edits.length && !boot.length) continue;
-  try { applySurgery(model, { sid: s.sid, edits, boot, dryRun: true }); mapOk++; mapItems += edits.length + boot.length; }
-  catch (e) { mapFail++; broken.push({ sid: s.sid.slice(0, 8), name: 'map: delete everything', error: e.message, problems: (e.problems || []).slice(0, 3).map(x => x.error) }); }
+  if (latest && (drop.size || edits.length || boot.length)) attempt('all but latest', s.sid, { drop: [...drop], edits, boot });
 }
-console.log(`map        sessions ${mapOk + mapFail}  verified ${mapOk}  FAILED ${mapFail}  (${mapItems} items marked at once)`);
+for (const [k, [n, good]] of Object.entries(tally)) console.log(`${k.padEnd(15)} attempted ${String(n).padStart(4)}  verified ${String(good).padStart(4)}  FAILED ${n - good}`);
+if (dropRefused.length) console.log(`refused as expected (${dropRefused.length}):\n  ${dropRefused.slice(0, 8).join('\n  ')}`);
 for (const b of broken.filter(x => x.name.startsWith('map'))) console.log(' ', JSON.stringify(b));
 process.exit(failed || broken.length ? 1 : 0);

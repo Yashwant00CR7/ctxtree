@@ -16,6 +16,8 @@ export function build(root = PROJECTS_DIR) {
 
   for (const s of scan.sessions) {
     const v = scan.byId.get(s.sid);
+    // a rescan reuses an unchanged session's chunks: drop the last build's thinking
+    if (v.chunks.length && v.chunks[v.chunks.length - 1].fp === `think.${s.sid}`) v.chunks.pop();
     const fit = fitSession(s, v.chunks, cal);
     const scale = fit.scale;
 

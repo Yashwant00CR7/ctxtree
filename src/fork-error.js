@@ -1,3 +1,2 @@
-export class ForkError extends Error {
-  constructor(message, problems = []) { super(message); this.problems = problems; }
-}
+// Moved to the shared core (plugins/ctxtree/core), which the Claude Code mod also runs.
+export * from '../plugins/ctxtree/core/fork-error.js';

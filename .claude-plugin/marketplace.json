@@ -1,0 +1,17 @@
+{
+  "name": "ctxtree",
+  "description": "ctxtree for Claude Code: see what fills the context window and edit it live, from a terminal pane or by asking Claude.",
+  "owner": {
+    "name": "Yashwant00CR7"
+  },
+  "plugins": [
+    {
+      "name": "ctxtree",
+      "source": "./plugins/ctxtree"
+    },
+    {
+      "name": "ctxtree-ui",
+      "source": "./plugins/ctxtree-ui"
+    }
+  ]
+}

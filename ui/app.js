@@ -108,6 +108,10 @@
     view: store.get('view', 'tasks'),
     sorts: { tasks: store.get('sort.tasks', { key: 'turn', dir: 1 }), types: store.get('sort.types', { key: 'tok', dir: -1 }) },
     rows: [], forks: [], actByKey: new Map(),
+    tab: store.get('sideTab', 'details'),
+    // a task's acts (task key -> every key in it) and the task each key sits in
+    taskKeys: new Map(), keyTask: new Map(),
+    env: { vtower: false }, version: 0, changed: false,
   };
   Object.defineProperty(S, 'sort', { get: () => S.sorts[S.view], set: (v) => { S.sorts[S.view] = v; store.set(`sort.${S.view}`, v); } });
   const curRoot = () => S.roots[0];
@@ -122,7 +126,6 @@
   const isMarked = (n) => canDelete(n) && actsOf(n).every(a => S.marks.has(akey(a)));
   const saveOf = (n) => actsOf(n).reduce((t, a) => t + (a.save || 0), 0);
   const markedSave = (n) => actsOf(n).reduce((t, a) => t + (S.marks.has(akey(a)) ? a.save || 0 : 0), 0);
-  const isShrink = (n) => actsOf(n).length === 1 && actsOf(n)[0].op === 'shrink';
   const isTask = (n) => n.t === 'task';
   const isToolOutput = (n) => !n.kids && (n.t.startsWith('r:') || n.t === 'call');
 
@@ -166,16 +169,28 @@
     S.undo.push({ marks: new Set(S.marks), ops: { ...S.ops } });
     if (S.undo.length > 100) S.undo.shift();
   }
+  // Your messages and Claude's last words go only with their whole task: marking
+  // one marks the task, and keeping any part of a marked task keeps the task.
   function setMarks(leaves, on) {
     snapshot();
-    for (const l of leaves) for (const a of actsOf(l)) { if (on) S.marks.add(akey(a)); else S.marks.delete(akey(a)); }
+    for (const l of leaves) for (const a of actsOf(l)) {
+      const k = akey(a);
+      if (on) {
+        S.marks.add(k);
+        if (a.task) for (const x of S.taskKeys.get(a.task) || []) S.marks.add(x);
+      } else if (a.task) {
+        for (const x of S.taskKeys.get(a.task) || []) S.marks.delete(x);
+      } else {
+        S.marks.delete(k);
+        const t = S.keyTask.get(k);
+        if (t) S.marks.delete(t);
+      }
+    }
     changed();
   }
   function toggleNode(n) {
     if (isGrey(n)) { openMenuFor(n); return; }
-    let leaves = deletableLeaves(n);
-    // on a task, ⌫ clears what tools produced and keeps the conversation
-    if (isTask(n) && leaves.some(isToolOutput)) leaves = leaves.filter(isToolOutput);
+    const leaves = deletableLeaves(n);
     if (!S.parent.get(n.id)) { openMenuFor(n); return; }
     if (!leaves.length) { toast(n.lock || 'Nothing here can be deleted.', true); return; }
     const allOn = leaves.every(isMarked);
@@ -216,17 +231,20 @@
     return (p && titleOf(p, depth + 1)) || s.title || '';
   }
 
-  async function openSession(sid, { keepMarks = false } = {}) {
+  // `reload`: the same session read again (it grew): marks, selection and the
+  // open folders stay where they were.
+  async function openSession(sid, { keepMarks = false, reload = false } = {}) {
     if (!sid) return;
     if (!keepMarks && S.sid && sid !== S.sid && (S.marks.size || opCount())) {
       if (!confirm('Switch session? Your marked deletions in this one will be cleared.')) return;
     }
+    const keep = reload && sid === S.sid;
     S.sid = sid;
     history.replaceState(null, '', `#${sid}`);
     const s = S.sessions.find(x => x.sid === sid);
     $('#session-title').textContent = titleOf(s) || sid.slice(0, 8);
     $('#session-meta').textContent = s ? `${s.projectName} · ${ago(s.lastTs)}${forkOf(sid) ? ' · fork' : ''}` : '';
-    $('#tree-spacer').replaceChildren(h('div', { class: 'loading', text: 'Reading session…' }));
+    if (!keep) $('#tree-spacer').replaceChildren(h('div', { class: 'loading', text: 'Reading session…' }));
     let map;
     try { map = await api(`/api/map?sid=${encodeURIComponent(sid)}`); } catch (e) { toast(e.message, true); return; }
     if (S.sid !== sid) return;
@@ -234,8 +252,29 @@
     S.actByKey = new Map();
     const collect = (n) => { if (n.kids) return n.kids.forEach(collect); for (const a of actsOf(n)) S.actByKey.set(akey(a), a); };
     collect(map.tree); collect(map.tasks);
-    S.marks = new Set(); S.ops = { uncompact: false, slim: false, switchTip: '' }; S.undo = [];
+    S.taskKeys = new Map(); S.keyTask = new Map();
+    const tasksOf = (n) => {
+      if (!n.kids) return;
+      if (n.t === 'task') {
+        const keys = new Set();
+        const each = (x) => { if (x.kids) return x.kids.forEach(each); for (const a of actsOf(x)) if (a.k === 'drop') keys.add(akey(a)); };
+        each(n);
+        const tk = `task:${n.id}`;
+        if (keys.has(tk)) { S.taskKeys.set(tk, keys); for (const k of keys) if (k !== tk) S.keyTask.set(k, tk); }
+        return;
+      }
+      n.kids.forEach(tasksOf);
+    };
+    tasksOf(map.tasks);
+    if (!keep) { S.marks = new Set(); S.ops = { uncompact: false, slim: false, switchTip: '' }; S.undo = []; }
+    else S.marks = new Set([...S.marks].filter(k => S.actByKey.has(k)));
+    timelines.clear(); blocks.clear();
+    if (!keep) { tlOpen.clear(); showView(S.view); return; }
+    const open = S.open, sel = S.sel, top = $('#tree').scrollTop;
     showView(S.view);
+    S.open = new Set([...open].filter(id => S.byId.has(id)));
+    $('#tree').scrollTop = top;
+    if (S.byId.has(sel)) select(sel, { scroll: false }); else changed();
   }
 
   // Two views of the same context. Marks are per action, so they carry over.
@@ -301,6 +340,7 @@
     const frag = document.createDocumentFragment();
     for (let i = a; i < b; i++) frag.append(rowEl(S.rows[i], i));
     spacer.replaceChildren(frag);
+    fitTree();
     document.querySelectorAll('#thead .th').forEach(th => {
       const on = th.dataset.sort === S.sort.key && !(th.classList.contains('c-pct'));
       th.classList.toggle('sorted', on);
@@ -345,7 +385,9 @@
     tok.append(fmt(n.tok));
     row.append(name, pctCell, tok,
       h('div', { class: 'c-n', text: group ? n.n.toLocaleString() : '' }),
-      h('div', { class: 'c-turn', text: isTask(n) && n.from != null && n.from !== n.turn ? `${n.from}–${n.turn}` : (n.turn ? String(n.turn) : (group ? '' : '—')) }));
+      h('div', { class: 'c-turn', text: isTask(n) && n.from != null && n.from !== n.turn ? `${n.from}–${n.turn}` : (n.turn ? String(n.turn) : (group ? '' : '—')) }),
+      h('div', { class: 'c-x' }, parent && !grey && (group ? n._d > 0 : canDelete(n))
+        ? h('button', { class: 'x-mark', 'data-x': '1', title: marked ? 'Keep (⌫)' : 'Mark for deletion (⌫)', 'aria-label': marked ? 'Keep' : 'Mark for deletion', text: marked ? '↺' : '✕' }) : null));
     return row;
   }
   function taskSub(n) {
@@ -395,6 +437,7 @@
       if (!row) return;
       const n = S.byId.get(row.dataset.id);
       if (e.target.closest('[data-chev]')) { toggleOpen(n); e.preventDefault(); return; }
+      if (e.target.closest('[data-x]')) { select(n.id, { scroll: false }); toggleNode(n); e.preventDefault(); return; }
       select(n.id, { scroll: false });
     });
     body.addEventListener('dblclick', (e) => {
@@ -567,8 +610,7 @@
       items.push(mh(n.name));
       if (canDelete(n)) {
         const on = isMarked(n);
-        const verb = isShrink(n) ? 'Shrink this call' : 'Delete';
-        items.push(on ? mi('Keep', `+${fmt(saveOf(n))}`, () => setMarks([n], false)) : mi(verb, `−${fmt(saveOf(n))}`, () => setMarks([n], true), { danger: true, note: n.stale || n.warn || '' }));
+        items.push(on ? mi('Keep', `+${fmt(saveOf(n))}`, () => setMarks([n], false)) : mi('Delete', `−${fmt(saveOf(n))}`, () => setMarks([n], true), { danger: true, note: n.stale || n.warn || '' }));
       } else items.push(mi('Can’t delete this', '', null, { disabled: true, note: n.lock || '' }));
     } else if (!S.parent.get(n.id)) {
       items.push(mh(n.name));
@@ -599,21 +641,21 @@
     items.push(msep(), mi('Copy name', '', () => navigator.clipboard && navigator.clipboard.writeText(n.name).then(() => toast('Copied'))));
     showMenu(items, x, y);
   }
-  // A task: clear what tools produced (the usual choice: you keep the
-  // conversation, so Claude still knows what happened), or all of it.
+  // A task: delete its tool steps (you keep what you asked and what Claude
+  // answered), or all of it.
   function taskItems(n) {
     const all = deletableLeaves(n), tools = all.filter(isToolOutput);
     const off = (l) => l.filter(x => !isMarked(x)), tok = (l) => fmt(l.reduce((a, x) => a + saveOf(x), 0));
     const items = [];
     if (!all.length) return [mi('Nothing here can be deleted', '', null, { disabled: true, note: firstLock(n) })];
-    if (off(tools).length) items.push(mi('Clear its tool output', `−${tok(off(tools))}`, () => setMarks(off(tools), true), { danger: true, note: 'Files read, commands run, code written. Keeps what you asked and what Claude answered.' }));
-    if (off(all).length) items.push(mi('Delete the whole task', `−${tok(off(all))}`, () => setMarks(off(all), true), { danger: true, note: 'Also your messages and Claude’s replies. Claude forgets this task happened.' }));
+    if (off(tools).length) items.push(mi('Delete its tool steps', `−${tok(off(tools))}`, () => setMarks(off(tools), true), { danger: true, note: 'Every call and what came back: files read, commands run, code written. Keeps what you asked and what Claude answered.' }));
+    if (off(all).length) items.push(mi('Delete the whole task', `−${tok(off(all))}`, () => setMarks(off(all), true), { danger: true, note: 'Your message, everything Claude did, and its replies. Nothing of it is left in the fork.' }));
     if (all.some(isMarked)) items.push(mi('Keep all of it', `+${tok(all.filter(isMarked))}`, () => setMarks(all, false)));
     const stale = off(all).filter(l => l.stale);
     if (stale.length && stale.length < off(all).length) items.push(mi('Delete only out-of-date copies', `−${tok(stale)}`, () => setMarks(stale, true), { danger: true, note: `${stale.length} item(s) a later turn replaced` }));
     return items;
   }
-  // The whole session: clear the tool output of every task but the latest few.
+  // The whole session: delete the tool steps of every task but the latest few.
   function cleanupItems() {
     const tasks = curRoot().kids.filter(k => isTask(k) && k.id.startsWith('g:task:')).sort((a, b) => (a.ord || 0) - (b.ord || 0));
     const earlier = curRoot().kids.find(k => k.id === 'g:earlier');
@@ -624,10 +666,10 @@
       const old = [...(earlier ? [earlier] : []), ...tasks.slice(0, tasks.length - keep)];
       const leaves = old.flatMap(t => deletableLeaves(t)).filter(l => isToolOutput(l) && !isMarked(l));
       if (!leaves.length) continue;
-      chips.push(h('button', { class: 'chip', title: `Clear the tool output of every task except the latest ${keep}`, onclick: () => { closeMenu(); setMarks(leaves, true); } }, `keep last ${keep} · −${fmt(leaves.reduce((a, l) => a + saveOf(l), 0))}`));
+      chips.push(h('button', { class: 'chip', title: `Delete the tool steps of every task except the latest ${keep}`, onclick: () => { closeMenu(); setMarks(leaves, true); } }, `keep last ${keep} · −${fmt(leaves.reduce((a, l) => a + saveOf(l), 0))}`));
     }
-    if (chips.length) out.push(mh('Clear tool output of older tasks'), h('div', { class: 'mchips' }, chips));
-    else out.push(mi('Right-click a task to clear it', '', null, { disabled: true }));
+    if (chips.length) out.push(mh('Delete tool steps of older tasks'), h('div', { class: 'mchips' }, chips));
+    else out.push(mi('Right-click a task to delete it', '', null, { disabled: true }));
     return out;
   }
   const countLeaves = (n) => (n.kids ? n.kids.reduce((a, k) => a + countLeaves(k), 0) : 1);
@@ -822,14 +864,36 @@
     for (const L of M.leaves) if (x >= L.x && x < L.x + L.w && y >= L.y && y < L.y + L.h) return L;
     return null;
   }
+  // The ✕ in the corner of the block under the mouse marks it (or keeps it).
+  const mapX = h('button', { class: 'map-x hidden', type: 'button' });
+  function placeX(r) {
+    if (!r || r.head || r.n.kids || !canDelete(r.n) || isGrey(r.n) || r.w < 30 || r.h < 24) { mapX.classList.add('hidden'); mapX._n = null; return; }
+    const on = isMarked(r.n);
+    mapX._n = r.n;
+    mapX.textContent = on ? '↺' : '✕';
+    mapX.title = on ? 'Keep (⌫)' : 'Mark for deletion (⌫)';
+    mapX.setAttribute('aria-label', mapX.title);
+    mapX.classList.toggle('on', on);
+    mapX.style.left = `${r.x + r.w - 24}px`; mapX.style.top = `${r.y + 4}px`;
+    mapX.classList.remove('hidden');
+  }
   function mapEvents() {
     const c = $('#map-over'), tip = $('#tip'), wrap = $('#map-wrap');
+    wrap.append(mapX);
+    mapX.addEventListener('mousedown', (e) => { e.stopPropagation(); e.preventDefault(); });
+    mapX.addEventListener('click', () => {
+      const n = mapX._n;
+      if (!n) return;
+      select(n.id, { fromMap: true });
+      toggleNode(n);
+      placeX(S.hover);
+    });
     const pos = (e) => { const r = c.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
     c.addEventListener('mousemove', (e) => {
       const [x, y] = pos(e);
       const r = hit(x, y);
-      if (!r) { tip.classList.add('hidden'); if (S.hover) { S.hover = null; renderOverlay(); } return; }
-      if (!S.hover || S.hover.n !== r.n) { S.hover = r; renderOverlay(); fillTip(r.n); }
+      if (!r) { tip.classList.add('hidden'); placeX(null); if (S.hover) { S.hover = null; renderOverlay(); } return; }
+      if (!S.hover || S.hover.n !== r.n) { S.hover = r; renderOverlay(); fillTip(r.n); placeX(r); }
       tip.classList.remove('hidden');
       const tw = tip.offsetWidth, th = tip.offsetHeight;
       let tx = x + 14, ty = y + 16;
@@ -837,7 +901,12 @@
       if (ty + th > wrap.clientHeight) ty = y - th - 10;
       tip.style.left = `${Math.max(0, tx)}px`; tip.style.top = `${Math.max(0, ty)}px`;
     });
-    c.addEventListener('mouseleave', () => { tip.classList.add('hidden'); S.hover = null; renderOverlay(); });
+    c.addEventListener('mouseleave', (e) => {
+      tip.classList.add('hidden');
+      if (e.relatedTarget === mapX) return;
+      placeX(null); S.hover = null; renderOverlay();
+    });
+    mapX.addEventListener('mouseleave', (e) => { if (e.relatedTarget !== c) { placeX(null); S.hover = null; renderOverlay(); } });
     c.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
       const [x, y] = pos(e);
@@ -871,7 +940,7 @@
       n.turn ? h('span', { text: `turn ${n.turn}` }) : null));
     if (n.kids) kids.push(h('div', { class: 't-row', text: `${n.n.toLocaleString()} items` }));
     if (isTask(n) && n.ts) kids.push(h('div', { class: 't-row', text: taskSub(n) }));
-    if (isMarked(n)) kids.push(h('div', { class: 't-mark', text: isShrink(n) ? 'Marked to shrink' : 'Marked for deletion' }));
+    if (isMarked(n)) kids.push(h('div', { class: 't-mark', text: 'Marked for deletion' }));
     else if (!n.kids && !canDelete(n)) kids.push(h('div', { class: 't-lock', text: n.lock || '' }));
     else if (n.stale) kids.push(h('div', { class: 't-lock', text: n.stale }));
     tip.replaceChildren(...kids);
@@ -902,12 +971,13 @@
     if (count) parts.push(`${count.toLocaleString()} marked · −${fmt(cut)} tokens`);
     if (ops) parts.push(`${ops} file change${ops > 1 ? 's' : ''}`);
     $('#status-marked').textContent = parts.join(' · ');
+    const pill = $('#btn-reload');
+    pill.classList.toggle('hidden', !S.changed);
     $('#btn-review').disabled = !(count || ops);
     $('#btn-undo').disabled = !S.undo.length;
   }
 
   // -------------------------------------------------------------- details
-  let detailsReq = 0;
   function renderDetails() {
     const el = $('#details');
     const n = S.byId.get(S.sel);
@@ -943,42 +1013,130 @@
       const all = deletableLeaves(n), tools = all.filter(isToolOutput);
       const toolsOn = tools.length && tools.every(isMarked), allOn = all.length && all.every(isMarked);
       const tok = (l) => fmt(l.reduce((a, x) => a + saveOf(x), 0));
-      if (tools.length) acts.append(h('button', { class: toolsOn ? 'secondary' : 'primary danger', title: 'Files read, commands run, code written. Keeps what you asked and what Claude answered.',
-        text: toolsOn ? 'Keep tool output' : `Clear tool output  −${tok(tools)}`, onclick: () => setMarks(tools, !toolsOn) }));
-      if (all.length > tools.length) acts.append(h('button', { class: 'secondary', title: 'Also your messages and Claude’s replies',
-        text: allOn ? 'Keep everything' : `Delete whole task  −${tok(all)}`, onclick: () => setMarks(all, !allOn) }));
+      if (all.length > tools.length) acts.append(h('button', { class: allOn ? 'secondary' : 'primary danger', title: 'Your message, everything Claude did, and its replies. Nothing of it is left in the fork.',
+        text: allOn ? 'Keep the task' : `Delete whole task  −${tok(all)}`, onclick: () => setMarks(all, !allOn) }));
+      if (tools.length) acts.append(h('button', { class: 'secondary', title: 'Every call and what came back. Keeps what you asked and what Claude answered.',
+        text: toolsOn ? 'Keep tool steps' : `Delete tool steps  −${tok(tools)}`, onclick: () => setMarks(tools, !toolsOn) }));
     } else if (S.parent.get(n.id)) {
       const leaves = deletableLeaves(n);
       if (leaves.length) {
         const all = leaves.every(isMarked);
-        const verb = !n.kids && isShrink(n) ? 'Shrink' : 'Delete';
-        acts.append(h('button', { class: all ? 'secondary' : 'primary danger', text: all ? 'Keep' : (n.kids ? `${verb} ${leaves.length > 1 ? `all ${leaves.length}` : ''}`.trim() : verb), onclick: () => setMarks(leaves, !all) }));
+        acts.append(h('button', { class: all ? 'secondary' : 'primary danger', text: all ? 'Keep' : (n.kids && leaves.length > 1 ? `Delete all ${leaves.length}` : 'Delete'), onclick: () => setMarks(leaves, !all) }));
       }
     }
     if (acts.childNodes.length) kids.push(acts);
 
     // what it actually says: a task item shows the call, then what came back
-    const ids = n.kids ? [] : (n.blocks || [(actsOf(n)[0] && actsOf(n)[0].k === 'block' && actsOf(n)[0].id) || (/^(b_|l_|d:)/.test(n.id) ? n.id : null)].filter(Boolean));
-    const req = ++detailsReq;
-    ids.forEach((id, i) => {
-      if (ids.length > 1) kids.push(h('div', { class: 'label', style: 'margin:8px 0 4px', text: i === 0 ? 'Claude sent' : 'It got back' }));
-      const pre = h('pre', { class: 'd-pre', text: 'Loading…' });
-      kids.push(pre);
-      api(`/api/block?sid=${encodeURIComponent(S.sid)}&id=${encodeURIComponent(id)}`).then(b => {
-        if (req !== detailsReq) return;
-        pre.textContent = b.text || '(empty)';
-        if (b.truncated) pre.after(h('div', { class: 'd-more', text: `Showing the first 6,000 of ${b.chars.toLocaleString()} characters.` }));
-      }).catch(e => { if (req === detailsReq) pre.textContent = e.message; });
-    });
+    const ids = n.kids ? [] : (n.blocks || [/^(b_|l_|d:)/.test(n.id) ? n.id : null].filter(Boolean));
+    ids.forEach((id, i) => kids.push(...blockView(id, ids.length > 1 ? (i === 0 ? 'Claude sent' : 'It got back') : '')));
+    if (isTask(n)) kids.push(...timelineView(n));
+    // a redraw for the same selection (a mark, a load) keeps the reading position
+    const top = shownSel === n.id ? el.scrollTop : 0;
     el.replaceChildren(...kids);
+    el.scrollTop = top;
+    shownSel = n.id;
   }
+  let shownSel = null;
+
+  // ------------------------------------------------------------- timeline
+  // Block text as loaded: the first 20,000 characters, then all of it on
+  // request. Kept per session so redraws (a mark, a tab switch) cost nothing.
+  const blocks = new Map();
+  function loadBlock(id, all = false) {
+    const have = blocks.get(id);
+    if (have && (have.loading || !all || !have.next)) return;
+    blocks.set(id, { ...(have || { text: '' }), loading: true });
+    const q = `/api/block?sid=${encodeURIComponent(S.sid)}&id=${encodeURIComponent(id)}${all ? `&offset=${have.next}&full=1` : ''}`;
+    const sid = S.sid;
+    api(q).then(b => {
+      if (S.sid !== sid) return;
+      blocks.set(id, { text: (all ? have.text : '') + (b.text || ''), chars: b.chars, next: b.next, isError: b.isError });
+      renderDetails();
+    }).catch(e => { blocks.set(id, { text: '', err: e.message, next: 0 }); renderDetails(); });
+  }
+  function blockView(id, label) {
+    const out = [];
+    if (label) out.push(h('div', { class: 'label', text: label }));
+    const b = blocks.get(id);
+    if (!b) loadBlock(id);
+    out.push(h('pre', { class: 'd-pre', text: !b || (b.loading && !b.text) ? 'Loading…' : b.err || b.text || '(empty)' }));
+    if (b && b.next) {
+      out.push(h('div', { class: 'd-more' },
+        h('span', { text: `Showing the first ${b.text.length.toLocaleString()} of ${b.chars.toLocaleString()} characters.` }),
+        h('button', { text: b.loading ? 'Loading…' : `Show all ${b.chars.toLocaleString()}`, disabled: !!b.loading, onclick: () => loadBlock(id, true) })));
+    }
+    return out;
+  }
+
+  // A task, as it happened: your message, then every tool call and reply in
+  // order. Messages show in full; a tool call opens in place to show what
+  // Claude sent and what came back.
+  const timelines = new Map();
+  const tlOpen = new Set();
+  function timelineView(n) {
+    const key = n.id;
+    const tl = timelines.get(key);
+    if (!tl) {
+      timelines.set(key, { loading: true });
+      const sid = S.sid;
+      api(`/api/timeline?sid=${encodeURIComponent(sid)}&id=${encodeURIComponent(n.id)}`)
+        .then(r => { if (S.sid !== sid) return; timelines.set(key, { entries: r.entries }); if (S.sel === n.id) renderDetails(); })
+        .catch(e => { timelines.set(key, { err: e.message }); if (S.sel === n.id) renderDetails(); });
+    }
+    if (!tl || tl.loading) return [h('div', { class: 'd-more', text: 'Loading the timeline…' })];
+    if (tl.err) return [h('p', { class: 'd-warn', text: tl.err })];
+    const tools = tl.entries.filter(e => e.kind === 'tool');
+    const allOpen = tools.length && tools.every(e => tlOpen.has(e.id));
+    const head = h('div', { class: 'd-more', style: 'margin:4px 0 8px' },
+      h('span', { class: 'label', text: `What happened · ${tl.entries.length} item${tl.entries.length === 1 ? '' : 's'}, ${tools.length} tool call${tools.length === 1 ? '' : 's'}` }),
+      tools.length ? h('button', { text: allOpen ? 'Collapse all' : 'Expand all', onclick: () => { for (const e of tools) { if (allOpen) tlOpen.delete(e.id); else tlOpen.add(e.id); } renderDetails(); } }) : null);
+    return [head, h('div', { class: 'tl' }, tl.entries.map(timelineEntry))];
+  }
+  // (a run of attachments shown as one entry is marked as the run)
+  function markButton(e) {
+    const nodes = (e.ids || [e.id]).map(id => S.byId.get(id)).filter(n => n && canDelete(n));
+    if (!nodes.length) return null;
+    const on = nodes.every(isMarked);
+    return h('button', { class: `tl-mark${on ? ' on' : ''}`, title: on ? 'Keep it' : (nodes[0].info || 'Mark for deletion'), text: on ? '✕ marked' : 'delete',
+      onclick: (ev) => { ev.stopPropagation(); setMarks(nodes, !on); } });
+  }
+  function timelineEntry(e) {
+    const node = S.byId.get(e.id);
+    const marked = node && isMarked(node);
+    if (e.kind === 'prompt' || e.kind === 'reply') {
+      const b = blocks.get(e.id);
+      const text = b && !b.loading && b.text ? b.text : e.text;
+      const more = b ? b.next : (e.truncated ? 1 : 0);
+      return h('div', { class: `tl-msg ${e.kind}${marked ? ' marked' : ''}` },
+        h('div', { class: 'tl-who' }, h('b', { text: e.kind === 'prompt' ? (/^You: /.test(e.name) ? 'You' : e.name.split(':')[0]) : 'Claude' }),
+          e.turn ? h('span', { text: `turn ${e.turn}` }) : null, h('span', { class: 'tl-tok', text: fmt(e.tok) }), markButton(e)),
+        h('div', { class: 'tl-text', text: tidyMsg(text) || '(empty)' }),
+        more ? h('div', { class: 'd-more' }, h('span', { text: `Showing the first ${text.length.toLocaleString()} of ${(b ? b.chars : e.chars).toLocaleString()} characters.` }),
+          h('button', { text: b && b.loading ? 'Loading…' : 'Show all', onclick: () => { if (!b) { blocks.set(e.id, { text: e.text, chars: e.chars, next: e.text.length }); } loadBlock(e.id, true); } })) : null);
+    }
+    if (e.kind === 'tool') {
+      const open = tlOpen.has(e.id);
+      const body = open ? h('div', { class: 'tl-body' }, e.parts.flatMap(p => blockView(p.id, e.parts.length > 1 ? (p.role === 'sent' ? 'Claude sent' : 'It got back') : (p.role === 'sent' ? 'Claude sent (no result recorded)' : 'It got back')))) : null;
+      return h('div', { class: `tl-tool${marked ? ' marked' : ''}` },
+        h('div', { class: 'tl-head', title: e.name, onclick: () => { if (open) tlOpen.delete(e.id); else tlOpen.add(e.id); renderDetails(); } },
+          h('span', { class: `chev${open ? ' open' : ''}` }, svg(ICON.chev)),
+          h('span', { class: 'sw', style: `background:${colorOf(e.t)}` }),
+          h('span', { class: 'tl-name', text: e.name }),
+          e.err ? h('span', { class: 'tl-flag bad', text: 'error' }) : null,
+          e.stale ? h('span', { class: 'tl-flag old', title: e.stale, text: 'out of date' }) : null,
+          h('span', { class: 'tl-tok', text: fmt(e.tok) }), markButton(e)),
+        body);
+    }
+    const all = (e.ids || [e.id]).map(id => S.byId.get(id)).filter(Boolean);
+    return h('div', { class: `tl-other${all.length && all.every(isMarked) ? ' marked' : ''}` }, h('span', { text: `${e.name} · ${fmt(e.tok)}` }), markButton(e));
+  }
+  // Messages as you wrote them, without the XML wrappers Claude Code adds.
+  const tidyMsg = (t) => String(t || '').replace(/<\/?(command-[a-z-]+|local-command-[a-z-]+|system-reminder)>/g, '').trim();
 
   // A task, explained: what you asked, how it ended, what it touched, and
   // whether anything since still leans on it.
   function taskDetails(n) {
     const out = [];
-    if (n.ask) out.push(h('div', { class: 'label', text: 'You asked' }), h('blockquote', { class: 'd-quote', text: tidyText(n.ask, 420) }));
-    if (n.outcome) out.push(h('div', { class: 'label', text: 'Claude’s last reply in this task' }), h('blockquote', { class: 'd-quote', text: tidyText(n.outcome, 420) }));
     if (n.files && n.files.length) out.push(h('div', { class: 'label', text: 'Files it touched' }),
       h('div', { class: 'd-files' }, n.files.map(f => h('span', { class: 'file', title: f, text: f.split('/').pop() }))));
     const signals = [];
@@ -990,23 +1148,23 @@
     if (signals.length) out.push(h('ul', { class: 'd-signals' }, signals.map(([c, t]) => h('li', { class: c, text: t }))));
     return out;
   }
-  const tidyText = (t, n) => { const s = String(t || '').replace(/<\/?[a-z][\w-]*[^>]*>/gi, ' ').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n)}…` : s; };
 
   // --------------------------------------------------------------- review
   let drawerMode = '', verifyReq = 0;
   function payload() {
-    const edits = [], boot = [];
+    const edits = [], drop = [], boot = [];
     for (const key of S.marks) {
       const a = S.actByKey.get(key);
       if (!a) continue;
-      if (a.k === 'block') edits.push({ id: a.id, fp: a.fp, op: a.op || 'tombstone' });
+      if (a.k === 'drop') drop.push(a.id);
+      else if (a.k === 'img') edits.push({ id: a.id, fp: a.fp, op: 'remove' });
       else if (a.k === 'boot') boot.push(a.id);
     }
     const structure = [];
     if (S.ops.switchTip) structure.push({ op: 'switch', tip: S.ops.switchTip });
     if (S.ops.uncompact) structure.push({ op: 'uncompact' });
     if (S.ops.slim) structure.push({ op: 'slim' });
-    return { sid: S.sid, edits, boot, structure };
+    return { sid: S.sid, edits, drop, boot, structure };
   }
   function openDrawer(mode) {
     drawerMode = mode;
@@ -1080,8 +1238,8 @@
 
     const warns = new Set(), profile = [];
     for (const n of marked) { if (n.warn && n.t !== 'prompt' && n.t !== 'reply') warns.add(n.warn); if (n.profile) profile.push(n); }
-    const conv = marked.filter(n => n.t === 'prompt' || n.t === 'reply');
-    if (conv.length) warns.add(`${conv.length} message${conv.length > 1 ? 's' : ''} from the conversation itself will be replaced by a note. Claude loses what ${conv.length > 1 ? 'they' : 'it'} said.`);
+    const tasks = new Set(marked.flatMap(n => actsOf(n).filter(a => a.task && S.marks.has(a.task)).map(a => a.task)));
+    if (tasks.size) warns.add(`${tasks.size} whole task${tasks.size > 1 ? 's go' : ' goes'}: your message, everything Claude did for it, and its replies.`);
     if (warns.size) body.append(h('div', { class: 'callout warn' }, h('b', { text: 'Check before you go' }), h('ul', null, [...warns].slice(0, 6).map(w => h('li', { text: w })))));
     if (profile.length) body.append(h('div', { class: 'callout' }, h('b', { text: 'Resume with the command ctxtree gives you. ' }),
       `${profile.length} setup removal${profile.length > 1 ? 's need' : ' needs'} a launch profile (a small settings file) so Claude Code doesn’t load ${profile.length > 1 ? 'them' : 'it'} again. Plain claude --resume would bring ${profile.length > 1 ? 'them' : 'it'} back.`));
@@ -1092,7 +1250,7 @@
       for (const n of items.slice(0, 40)) {
         sec.append(h('div', { class: 'qrow' }, h('span', { class: 'sw', style: `background:${colorOf(n.t)}` }),
           h('span', { class: 'nm', text: n.name, title: ancestors(n).reverse().slice(1).map(a => a.name).concat(n.name).join(' › ') }),
-          h('span', { class: 't', text: `${isShrink(n) ? 'shrink ' : ''}−${fmt(markedSave(n))}` }),
+          h('span', { class: 't', text: `−${fmt(markedSave(n))}` }),
           h('button', { class: 'x', title: 'Keep this', text: '×', onclick: () => { setMarks([n], false); if (!S.marks.size && !opCount()) closeDrawer(); else verify(); } })));
       }
       if (items.length > 40) sec.append(h('div', { class: 'qmore', text: `and ${items.length - 40} more` }));
@@ -1116,7 +1274,7 @@
         h('button', { class: 'dr-x', text: '×', title: 'Close', onclick: closeDrawer })),
       body,
       h('div', { class: 'dr-foot' },
-        h('div', { class: 'label', text: 'ctxtree writes a new session (a fork) without these. Your original session is not changed.' }),
+        h('div', { class: 'label', text: 'ctxtree writes a new session (a fork) with these deleted completely: no note, no trace, so Claude will not know they happened. Your original session is not changed.' }),
         note,
         h('div', { class: 'dr-btns' }, h('button', { class: 'secondary', text: 'Cancel', onclick: closeDrawer }), commit)));
     paintVerify();
@@ -1159,7 +1317,18 @@
         r.profileFile ? h('p', { class: 'd-note', text: 'This fork has a launch profile, so use one of these commands rather than a plain claude --resume.' }) : null),
       h('div', { class: 'dr-foot' }, h('div', { class: 'dr-btns' },
         h('button', { class: 'secondary', text: 'Done', onclick: closeDrawer }),
-        h('button', { class: 'primary', text: 'Open the fork here', onclick: () => { closeDrawer(); openSession(r.forkSid); } }))));
+        h('button', { class: S.env.vtower ? 'secondary' : 'primary', text: 'View its map', onclick: () => { closeDrawer(); openSession(r.forkSid); } }),
+        S.env.vtower ? h('button', { class: 'primary', text: 'Open in vTower', onclick: () => openInVtower(r.forkSid, cmd) }) : null)));
+  }
+  // A new vTower tab in the fork's folder, resuming it (the server opens the
+  // vtower:// link); without vTower, the command to paste.
+  async function openInVtower(forkSid, cmd) {
+    try { await api('/api/open-fork', { forkSid }); toast('Opening in vTower'); }
+    catch (e) {
+      const c = (e.data && e.data.resumeCmd) || cmd;
+      if (c && navigator.clipboard) { await navigator.clipboard.writeText(c).catch(() => {}); toast(`${e.message} The resume command is copied.`, true); }
+      else toast(e.message, true);
+    }
   }
 
   // ---------------------------------------------------------------- forks
@@ -1179,7 +1348,8 @@
         h('div', { class: 'f-top' }, h('span', { class: 'f-note', text: f.note || 'Fork' }), h('span', { class: 'f-saved', text: f.savedTok ? `−${fmt(f.savedTok)}` : '' })),
         h('div', { class: 'f-meta', text: `${f.projectName || ''} · ${ago(f.createdAt)} · ${f.forkSid.slice(0, 8)}${f.exists === false ? ' · file missing' : ''}${f.grown ? ' · continued since' : ''}` }),
         h('div', { class: 'f-btns' },
-          f.exists !== false ? h('button', { text: 'Open', onclick: () => { closeDrawer(); openSession(f.forkSid); } }) : null,
+          f.exists !== false && S.env.vtower ? h('button', { class: 'primary', text: 'Open in vTower', onclick: () => openInVtower(f.forkSid, f.resumeCmd) }) : null,
+          f.exists !== false ? h('button', { text: 'View map', onclick: () => { closeDrawer(); openSession(f.forkSid); } }) : null,
           h('button', { text: 'Copy resume command', onclick: copy }),
           h('button', { class: 'del', text: 'Revert', title: 'Delete this fork (the original stays)', onclick: () => revert(f) }))));
     }
@@ -1244,12 +1414,30 @@
     });
   }
 
+  // ------------------------------------------------------------ side tabs
+  // Details and Types share the side column, one at a time, full height.
+  function showTab(tab) {
+    S.tab = tab === 'types' ? 'types' : 'details';
+    store.set('sideTab', S.tab);
+    document.querySelectorAll('.side-tabs button').forEach(b => { b.classList.toggle('on', b.dataset.tab === S.tab); b.setAttribute('aria-selected', String(b.dataset.tab === S.tab)); });
+    $('#types-panel').classList.toggle('hidden', S.tab !== 'types');
+    $('#details').classList.toggle('hidden', S.tab !== 'details');
+  }
+
   // ------------------------------------------------------------ splitters
+  // The tree takes the height of its rows, at most `treeMax` of the left
+  // column (the divider sets that); the treemap gets the rest.
+  function fitTree() {
+    const left = $('#left'), pane = $('#tree-pane');
+    if (!left.clientHeight) return;
+    const max = store.get('treeMax', 0.45) * left.clientHeight;
+    const need = $('#thead').offsetHeight + Math.max(3, S.rows.length) * ROW + 4;
+    const want = `${Math.round(Math.max(96, Math.min(max, need)))}px`;
+    if (pane.style.height !== want) pane.style.height = want;
+  }
   function splitters() {
-    const upper = $('#upper'), side = $('#side-pane');
-    const hFrac = store.get('splitH', 0.52), vFrac = store.get('splitV', 0.36);
-    upper.style.flexBasis = `${hFrac * 100}%`;
-    side.style.flexBasis = `${vFrac * 100}%`;
+    const side = $('#side-pane');
+    side.style.flexBasis = `${store.get('splitV', 0.42) * 100}%`;
     const drag = (el, onMove, onEnd) => el.addEventListener('mousedown', (e) => {
       e.preventDefault();
       el.classList.add('drag');
@@ -1258,18 +1446,18 @@
       addEventListener('mousemove', move); addEventListener('mouseup', up);
     });
     drag($('#split-h'), (e) => {
-      const r = $('#main').getBoundingClientRect();
-      const f = Math.max(0.2, Math.min(0.8, (e.clientY - r.top) / r.height));
-      upper.style.flexBasis = `${f * 100}%`;
-      store.set('splitH', f);
+      const r = $('#left').getBoundingClientRect();
+      const f = Math.max(0.12, Math.min(0.85, (e.clientY - r.top) / r.height));
+      store.set('treeMax', f);
+      $('#tree-pane').style.height = `${Math.round(f * r.height)}px`;
       renderTree();
-    }, () => layoutMap());
+    }, () => { fitTree(); layoutMap(); });
     drag($('#split-v'), (e) => {
-      const r = upper.getBoundingClientRect();
+      const r = $('#main').getBoundingClientRect();
       const f = Math.max(0.22, Math.min(0.6, (r.right - e.clientX) / r.width));
       side.style.flexBasis = `${f * 100}%`;
       store.set('splitV', f);
-    }, () => {});
+    }, () => layoutMap());
   }
 
   // ----------------------------------------------------------------- boot
@@ -1285,14 +1473,41 @@
     b.classList.remove('spin');
   }
 
+  // The server bumps a version when a session file changes. The list follows;
+  // the open session reloads in place when nothing is marked, else it says so.
+  async function poll() {
+    if (document.hidden) return;
+    let v;
+    try { v = (await api('/api/version')).version; } catch { return; }
+    if (!S.version) { S.version = v; return; }
+    if (v === S.version) return;
+    S.version = v;
+    const before = S.sessions.find(x => x.sid === S.sid);
+    await loadSessions().catch(() => {});
+    const after = S.sessions.find(x => x.sid === S.sid);
+    if (!S.sid || !after || (before && before.bytes === after.bytes)) return;
+    if (!S.marks.size && !opCount() && !drawerMode) await openSession(S.sid, { reload: true });
+    else { S.changed = true; renderStatus(); }
+  }
+
   async function start() {
     treeEvents(); typeEvents(); mapEvents(); pickerEvents(); splitters();
+    api('/api/env').then(e => { S.env = e; }).catch(() => {});
+    setInterval(poll, 4000);
+    document.addEventListener('visibilitychange', poll);
+    document.querySelectorAll('.side-tabs button').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
+    showTab(S.tab);
     $('#btn-review').addEventListener('click', openReview);
     document.querySelectorAll('#view-seg button').forEach(b => b.addEventListener('click', () => { if (b.dataset.view !== S.view) showView(b.dataset.view); }));
     document.querySelectorAll('#view-seg button').forEach(b => b.classList.toggle('on', b.dataset.view === S.view));
     $('#btn-undo').addEventListener('click', undo);
     $('#btn-forks').addEventListener('click', openForks);
     $('#btn-rescan').addEventListener('click', rescan);
+    $('#btn-reload').addEventListener('click', async () => {
+      if ((S.marks.size || opCount()) && !confirm('Reload this session? It changed since you opened it; marks that still apply are kept.')) return;
+      S.changed = false; renderStatus();
+      await openSession(S.sid, { reload: true });
+    });
     $('#scrim').addEventListener('click', closeDrawer);
     document.addEventListener('mousedown', (e) => {
       if (!e.target.closest('#menu')) closeMenu();
@@ -1312,6 +1527,12 @@
       if (e.key === 'Escape') { closePicker(); if (drawerMode) closeDrawer(); }
       if (!typing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { undo(); e.preventDefault(); }
       if (!typing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { openPicker(); e.preventDefault(); }
+      if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'i' || e.key === 't')) { showTab(e.key === 't' ? 'types' : 'details'); e.preventDefault(); }
+      // ⌫ marks the selection wherever the focus is (the tree handles its own)
+      if (!typing && !drawerMode && (e.key === 'Delete' || e.key === 'Backspace') && !e.target.closest('#tree')) {
+        const n = S.byId.get(S.sel);
+        if (n && S.parent.get(n.id)) { toggleNode(n); e.preventDefault(); }
+      }
     }, true);
     let rt = 0;
     new ResizeObserver(() => { clearTimeout(rt); rt = setTimeout(() => { layoutMap(); renderTree(); }, 60); }).observe($('#map-wrap'));

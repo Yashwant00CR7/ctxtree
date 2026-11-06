@@ -1,0 +1,9 @@
+{
+  "name": "ctxtree",
+  "version": "0.1.0",
+  "description": "See what fills Claude's context window and edit it live: drop, shrink or bridge blocks, then restore them. Core: map, plan, Claude's tools and the live rebuild.",
+  "author": {
+    "name": "Yashwant00CR7"
+  },
+  "types": "./types/index.d.ts"
+}

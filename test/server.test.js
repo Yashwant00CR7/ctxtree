@@ -112,3 +112,43 @@ test('prune endpoint tombstones by tool_use_id', async () => {
   const missing = await api('POST', '/api/prune', { sid: fx.sid, tuids: ['toolu_nope'] });
   assert.equal(missing.status, 400);
 });
+
+test('timeline and block endpoints: a task in order, its output 20,000 characters at a time', async () => {
+  const map = (await api('GET', `/api/map?sid=${fx.sid}`)).json;
+  const task = map.tasks.kids.find(k => k.id.startsWith('g:task:'));
+  const tl = await api('GET', `/api/timeline?sid=${fx.sid}&id=${encodeURIComponent(task.id)}`);
+  assert.equal(tl.status, 200);
+  assert.deepEqual(tl.json.entries.map(e => e.kind), ['prompt', 'tool', 'reply']);
+  const got = tl.json.entries[1].parts.find(p => p.role === 'got').id;
+  const first = (await api('GET', `/api/block?sid=${fx.sid}&id=${encodeURIComponent(got)}`)).json;
+  assert.equal(first.text.length, 20000);
+  const rest = (await api('GET', `/api/block?sid=${fx.sid}&id=${encodeURIComponent(got)}&offset=${first.next}&full=1`)).json;
+  assert.equal(first.text.length + rest.text.length, first.chars);
+  assert.equal(rest.next, 0);
+  assert.equal((await api('GET', `/api/timeline?sid=${fx.sid}&id=g:task:nope`)).status, 400);
+});
+
+test('hard delete through the fork endpoint: a unit key, checked against the file', async () => {
+  const map = (await api('GET', `/api/map?sid=${fx.sid}`)).json;
+  const find = (n, p) => { if (p(n)) return n; for (const k of n.kids || []) { const f = find(k, p); if (f) return f; } return null; };
+  const step = find(map.tasks, n => !n.kids && (n.acts || []).some(a => a.k === 'drop' && a.id.startsWith('step:')));
+  assert.ok(step, 'a tool step is offered');
+  assert.equal(map.units, undefined, 'the units stay on the server');
+  const key = step.acts[0].id;
+  const dry = await api('POST', '/api/fork', { sid: fx.sid, drop: [key], dryRun: true });
+  assert.equal(dry.status, 200, dry.text);
+  assert.ok(dry.json.resume.saved > 0);
+  const stale = await api('POST', '/api/fork', { sid: fx.sid, drop: ['step:nope'], dryRun: true });
+  assert.equal(stale.status, 400);
+  assert.match(stale.json.error, /no longer in this session/);
+  assert.equal((await api('POST', '/api/fork', { sid: fx.sid, drop: 'x' })).status, 400);
+});
+
+test('live data and vTower: a version to poll, what is installed, forks only', async () => {
+  const v = await api('GET', '/api/version');
+  assert.equal(v.status, 200);
+  assert.ok(v.json.version >= 1);
+  assert.equal(typeof (await api('GET', '/api/env')).json.vtower, 'boolean');
+  assert.equal((await api('POST', '/api/open-fork', { forkSid: 'nope' })).status, 400);
+  assert.equal((await api('POST', '/api/open-fork', { forkSid: fx.sid })).status, 404, 'a session that is not a ctxtree fork is never opened');
+});

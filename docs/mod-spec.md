@@ -27,8 +27,8 @@ running session. No fork to resume, no restart.
 | Self-trace | The cleanup turn (request, map output, interview, staging) is erased by the same edit, leaving one note. |
 | Undo | Restore dropped blocks in place, live, keeping every turn since. Not gated (it only adds context). The snapshot covers a full rollback via resume. |
 | Proactive | Status line meter, always on. Nudge band when context crosses a threshold. |
-| Engine | One I/O-free core in `src/`; a Node adapter for the CLI, a `$` adapter for the mod. |
-| Web UI | **Superseded 2026-10-05**: the UI moves into the terminal, in two phases; the web UI is retired after phase 2. See [`tui-design.md`](tui-design.md), which also proposes replacing the *Engine* row with an engine sidecar. |
+| Engine | One I/O-free core (now `plugins/ctxtree/core/`, so it ships with the plugin); a Node adapter in `src/` for the CLI, a `$` adapter for the mod. Reconfirmed 2026-10-10 over the sidecar proposal. |
+| Web UI | **Superseded 2026-10-05**: the UI moves into the terminal, in two phases; the web UI is retired after phase 2. See [`tui-design.md`](tui-design.md) for the TUI decisions (2026-10-10). |
 | Fallback | If live replacement can't be made safe: same UX, but Apply builds a verified fork and puts `claude --resume <fork>` on the clipboard. |
 | Audience | Owner first, publishable later. Repo root is the plugin, loaded with `--plugin-dir`. |
 

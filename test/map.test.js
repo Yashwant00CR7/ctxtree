@@ -48,17 +48,20 @@ test('map: grey groups carry the structural ops that apply to them', () => {
   assert.equal(br.ops[0].tip, 'x2');
 });
 
-test('map: every deletable leaf, marked at once, builds a verified fork', () => {
+test('map: every deletable leaf, marked at once, builds a verified fork with no trace of them', () => {
   const md = model();
   const m = contextMap(md, fx.sid);
-  const edits = [], boot = [];
+  const edits = [], drop = [], boot = [];
   for (const l of leaves(m.tree)) for (const a of l.acts) {
-    if (a.k === 'block') edits.push({ id: a.id, fp: a.fp, op: a.op || 'tombstone' });
+    if (a.k === 'drop') drop.push(a.id);
+    else if (a.k === 'img') edits.push({ id: a.id, fp: a.fp, op: 'remove' });
     else boot.push(a.id);
   }
-  assert.ok(boot.length, 'setup items are offered');
-  const r = applySurgery(md, { sid: fx.sid, edits, boot, dryRun: true });
+  assert.ok(boot.length && drop.length, 'setup items and the conversation are offered');
+  const r = applySurgery(md, { sid: fx.sid, edits, drop, boot });
   assert.ok(r.ok && r.resume.saved > 0);
+  const raw = fs.readFileSync(r.forkFile, 'utf8');
+  assert.ok(!raw.includes('Actually do it differently'), 'the deleted prompt is nowhere in the fork');
 });
 
 test('shrink: long strings in a tool call keep their head and say what went', () => {
@@ -71,8 +74,7 @@ test('shrink: long strings in a tool call keep their head and say what went', ()
   assert.equal(shrinkInput({ file_path: '/a', content: 'short' }), null);
 });
 
-test('shrink: a big Write call is offered, shrinks in the fork, and keeps its pairing', () => {
-  // a session whose live tail is a Write with a large input and its result
+test('map: a Write call and its result are one step with one action', () => {
   const sid = crypto.randomUUID();
   const dir = path.join(CLAUDE, 'projects', F.PROJECT);
   const base = { sessionId: sid, cwd: '/tmp/x', version: '2.1.283', userType: 'external', isSidechain: false };
@@ -87,22 +89,15 @@ test('shrink: a big Write call is offered, shrinks in the fork, and keeps its pa
   const md = model();
   const m = contextMap(md, sid);
   const call = find(m.tree, n => n.t === 'call' && !n.kids);
-  const [a] = call.acts;
-  assert.equal(a.op, 'shrink');
-  assert.ok(a.save > call.tok * 0.9, 'nearly all of it is reclaimable');
-  // in the task view the call and its result are one item with both actions
-  const item = find(contextMap(md, sid).tasks, n => n.id === `s:${a.id}`);
-  assert.equal(item.name, 'Wrote a.js');
-  // ("File created" is already smaller than the note that would replace it)
-  assert.deepEqual(item.acts.map(x => x.op || 'tombstone'), ['shrink']);
-  const r = applySurgery(md, { sid, edits: [{ id: a.id, fp: a.fp, op: 'shrink' }] });
+  const res = find(m.tree, n => n.t === 'r:Write' && !n.kids);
+  assert.equal(call.acts[0].id, 'step:msg_w');
+  assert.equal(res.acts[0].id, 'step:msg_w');
+  const item = find(m.tasks, n => n.name === 'Wrote a.js');
+  assert.deepEqual(item.acts, [{ k: 'drop', id: 'step:msg_w', save: call.tok + res.tok }]);
+  const r = applySurgery(md, { sid, drop: ['step:msg_w'] });
   const fork = parseSession(fs.readFileSync(r.forkFile, 'utf8'));
-  const use = fork.blocks.find(b => b.blockType === 'tool_use');
-  assert.ok(use.chars < 400 && /ctxtree: removed/.test(use.text));
-  assert.equal(fork.blocks.find(b => b.blockType === 'tool_result').tuid, 'toolu_w');
-  // the shrunk fork no longer offers it
-  const m2 = contextMap(build(path.join(CLAUDE, 'projects')), r.forkSid);
-  assert.ok(!find(m2.tree, n => n.t === 'call' && !n.kids && n.acts.length));
+  assert.deepEqual(fork.rows.map(x => x.rec.uuid), ['w1', 'w4']);
+  assert.equal(fork.byUuid.get('w4').parentUuid, 'w1');
 });
 
 test('block preview: bounded, and only for blocks in this session', () => {

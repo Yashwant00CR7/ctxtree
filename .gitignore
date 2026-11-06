@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 *.log
+.idea/
+plugins/*/.claude-plugin/types/
+

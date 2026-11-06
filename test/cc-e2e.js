@@ -247,6 +247,51 @@ check('tool session ran a Write call', r.req && wire(r.req).includes('BIGCONTENT
   }
 }
 
+// ---------------------------------------------------------- 6. hard delete
+// A tool step, a whole task, and the latest task leave the fork completely:
+// the resumed request carries no trace of them, and still pairs and alternates.
+{
+  const { build } = await import('../src/model.js');
+  const { contextMap } = await import('../src/map.js');
+  const { dropRecs } = await import('../plugins/ctxtree/core/map.js');
+  const HD = crypto.randomUUID();
+  await claude(['-p', 'HARDTASK-MARKER please write the file WRITE-TOOL-MARKER', '--session-id', HD], ['--permission-mode', 'bypassPermissions']);
+  await claude(['-p', 'KEEPTASK-MARKER now tell me what you did', '--resume', HD]);
+  const m = contextMap(build(), HD);
+  const tasks = m.tasks.kids.filter(k => k.t === 'task' && k.id.startsWith('g:task:'));
+  const keysOf = (n) => { const out = new Set(); const w = (x) => { if (x.kids) return x.kids.forEach(w); for (const a of x.acts) if (a.k === 'drop') out.add(a.id); }; w(n); return [...out]; };
+  const hard = tasks.find(t => t.name.includes('HARDTASK')), keep = tasks.find(t => t.name.includes('KEEPTASK'));
+  check('hard delete: both tasks are on the map', !!(hard && keep), JSON.stringify(tasks.map(t => t.name)));
+  const blocksOf = (req) => req.messages.flatMap(x => (Array.isArray(x.content) ? x.content : []));
+  const alternates = (req) => req.messages.every((x, i) => i === 0 || x.role !== req.messages[i - 1].role || x.role === 'user');
+  if (hard && keep) {
+    const step = [...m.units.keys()].find(k => k.startsWith('step:'));
+    let f = forkSession(sess(HD), [], { structure: [{ op: 'drop', recs: dropRecs(m, [step]) }], kind: 'drop' });
+    r = await claude(['-p', 'after dropping the step', '--resume', f.forkSid]);
+    check('step fork resumes', r.code === 0 && r.req, r.out.slice(0, 300));
+    if (r.req) {
+      const w = wire(r.req);
+      check('the step is gone: no call, no result, no written content', !w.includes('BIGCONTENT-MARKER') && !blocksOf(r.req).some(b => b.type === 'tool_use' || b.type === 'tool_result'));
+      check('the rest of the conversation stays', w.includes('HARDTASK-MARKER') && w.includes('KEEPTASK-MARKER'));
+      check('messages still alternate', alternates(r.req), JSON.stringify(r.req.messages.map(x => x.role)));
+    }
+    f = forkSession(sess(HD), [], { structure: [{ op: 'drop', recs: dropRecs(m, keysOf(hard)) }], kind: 'drop' });
+    check('task fork: the deleted prompt is nowhere in its file', !fs.readFileSync(f.forkFile, 'utf8').includes('HARDTASK-MARKER'));
+    r = await claude(['-p', 'after dropping the first task', '--resume', f.forkSid]);
+    check('task fork resumes', r.code === 0 && r.req, r.out.slice(0, 300));
+    if (r.req) {
+      const w = wire(r.req);
+      check('the task is gone from the request', !w.includes('HARDTASK-MARKER') && !w.includes('BIGCONTENT-MARKER'));
+      check('the other task stays', w.includes('KEEPTASK-MARKER'));
+      check('messages still alternate', alternates(r.req), JSON.stringify(r.req.messages.map(x => x.role)));
+    }
+    f = forkSession(sess(HD), [], { structure: [{ op: 'drop', recs: dropRecs(m, keysOf(keep)) }], kind: 'drop' });
+    r = await claude(['-p', 'after dropping the latest task', '--resume', f.forkSid]);
+    check('latest-task fork resumes where the conversation was before it', r.req && wire(r.req).includes('HARDTASK-MARKER') && !wire(r.req).includes('KEEPTASK-MARKER'), r.out.slice(0, 300));
+    if (r.req) check('and continues with the new prompt', lastUserText(r.req).includes('after dropping the latest task'), JSON.stringify(lastUserText(r.req)).slice(0, 300));
+  }
+}
+
 api.close();
 console.log(`\n${passed} passed, ${failed} failed`);
 if (!failed) fs.rmSync(ROOT, { recursive: true, force: true });

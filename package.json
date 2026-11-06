@@ -12,14 +12,19 @@
   "files": [
     "bin",
     "src",
-    "ui"
+    "ui",
+    "plugins"
   ],
   "scripts": {
     "start": "node bin/ctxtree.js",
     "test": "node --test test/*.test.js",
     "verify:real": "node test/real-dryrun.js",
-    "verify:cc": "node test/cc-e2e.js"
+    "verify:cc": "node test/cc-e2e.js",
+    "verify:tui": "node test/tui-e2e.js"
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "@xterm/headless": "6.0.0"
+  }
 }

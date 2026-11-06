@@ -135,10 +135,12 @@ kbd { font: 11px var(--mono); padding: 0 4px; border: 1px solid var(--line-2); b
 .seg button.on { background: var(--raise); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); font-weight: 500; }
 
 /* ------------------------------------------------------------- workspace */
-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.upper { flex: 0 0 52%; min-height: 140px; display: flex; min-width: 0; }
+/* The tree and the treemap share the left column: the tree only as tall as its
+   rows (up to the divider), the map the rest. Details runs the full height. */
+main { flex: 1; min-height: 0; display: flex; flex-direction: row; }
+.left { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .pane { background: var(--panel); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.tree-pane { flex: 1 1 62%; }
+.tree-pane { flex: 0 0 auto; height: 40%; min-height: 96px; }
 .side-pane { flex: 0 0 38%; min-width: 280px; }
 
 .splitter { flex: none; background: var(--line); position: relative; z-index: 2; }
@@ -205,8 +207,17 @@ button.th:hover { color: var(--text); }
 .c-n, .c-turn { color: var(--muted); }
 .minus { color: var(--danger); font-size: 11px; margin-right: 6px; }
 
+/* side panel: Details and Types are tabs, each the full height */
+.side-tabs {
+  height: 28px; flex: none; display: flex; align-items: stretch; gap: 2px; padding: 0 8px;
+  border-bottom: 1px solid var(--line); background: var(--panel-2);
+}
+.side-tabs button { padding: 0 10px; color: var(--muted); font-size: 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.side-tabs button:hover { color: var(--text); }
+.side-tabs button.on { color: var(--text); font-weight: 500; border-bottom-color: var(--accent); }
+
 /* types panel */
-.types { flex: 1 1 55%; min-height: 0; display: flex; flex-direction: column; border-bottom: 1px solid var(--line); }
+.types { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .types-body { flex: 1; overflow: auto; }
 .trow { height: var(--row); display: flex; align-items: center; cursor: default; user-select: none; }
 .trow > div { padding: 0 10px; display: flex; align-items: center; gap: 8px; overflow: hidden; white-space: nowrap; height: 100%; }
@@ -216,7 +227,7 @@ button.th:hover { color: var(--text); }
 .trow.dim { opacity: 0.4; }
 
 /* details */
-.details { flex: 1 1 45%; min-height: 0; overflow: auto; padding: 14px 16px 18px; }
+.details { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px 18px; }
 .details .empty { color: var(--faint); padding-top: 6px; }
 .d-kicker { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11.5px; margin-bottom: 4px; }
 .d-title { font-size: 14px; font-weight: 600; word-break: break-word; margin-bottom: 10px; line-height: 1.35; }
@@ -243,12 +254,41 @@ button.th:hover { color: var(--text); }
 .d-pre {
   margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--line);
   font: 11.5px/1.5 var(--mono); color: var(--muted); white-space: pre-wrap; word-break: break-word;
-  max-height: 340px; overflow: auto;
+  overflow-x: auto;
 }
-.d-more { color: var(--faint); font-size: 11.5px; margin-top: 6px; }
+.d-more { color: var(--faint); font-size: 11.5px; margin-top: 6px; display: flex; align-items: center; gap: 10px; }
+.d-more button { color: var(--accent); font-size: 11.5px; }
+.d-more button:hover { text-decoration: underline; }
+
+/* a task's timeline: messages in full, one expandable row per tool call */
+.tl { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 12px; }
+.tl-msg { padding: 8px 12px; border-radius: 0 6px 6px 0; background: var(--panel-2); border-left: 2px solid var(--line-2); }
+.tl-msg.prompt { border-left-color: #e2b04c; }
+.tl-msg.reply { border-left-color: #d98a5a; }
+.tl-who { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+.tl-who .tl-tok { margin-left: auto; font-variant-numeric: tabular-nums; }
+.tl-text { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; }
+.tl-msg.marked .tl-text, .tl-tool.marked .tl-name { text-decoration: line-through; text-decoration-color: var(--danger); color: var(--muted); }
+.tl-tool { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.tl-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; cursor: pointer; user-select: none; min-width: 0; }
+.tl-head:hover { background: var(--hover); }
+.tl-head .chev { flex: none; }
+.tl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
+.tl-tok { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: none; }
+.tl-flag { font-size: 11px; flex: none; }
+.tl-flag.old { color: var(--warn); }
+.tl-flag.bad { color: var(--danger); }
+.tl-mark { flex: none; font-size: 11px; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line-2); color: var(--muted); }
+.tl-mark:hover { color: var(--text); border-color: var(--muted); }
+.tl-mark.on { color: var(--danger); border-color: var(--danger); }
+.tl-body { padding: 4px 10px 10px; border-top: 1px solid var(--line); }
+.tl-body .label { display: block; margin: 8px 0 4px; }
+.tl-other { color: var(--faint); font-size: 11.5px; padding: 0 4px; display: flex; align-items: center; gap: 8px; }
+.tl-other > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-other.marked > span { text-decoration: line-through; text-decoration-color: var(--danger); }
 
 /* ----------------------------------------------------------------- map */
-.map-pane { flex: 1; min-height: 120px; display: flex; flex-direction: column; background: var(--map-bg); }
+.map-pane { flex: 1 1 auto; min-height: 120px; display: flex; flex-direction: column; background: var(--map-bg); }
 .map-bar {
   height: 26px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 12px;
   background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px;
@@ -424,3 +464,18 @@ button.th:hover { color: var(--text); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 10px; border: 3px solid var(--panel); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ------------------------------------------------------- delete controls */
+/* a ✕ at the end of a row (on hover, or while marked) and on the hovered block */
+.c-x { width: 32px; flex: none; padding: 0 6px 0 0 !important; justify-content: center; }
+.row .x-mark { width: 20px; height: 20px; border-radius: 5px; padding: 0;
+  display: none; align-items: center; justify-content: center; font-size: 12px; line-height: 1; color: var(--muted); background: var(--raise); border: 1px solid var(--line); }
+.row:hover .x-mark, .row.marked .x-mark { display: inline-flex; }
+.row .x-mark:hover { color: #fff; background: var(--danger); border-color: var(--danger); }
+.row.marked .x-mark { color: #fff; background: var(--danger); border-color: var(--danger); }
+.row.marked .x-mark:hover { background: var(--raise); color: var(--text); border-color: var(--line); }
+.map-x { position: absolute; z-index: 3; width: 20px; height: 20px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; line-height: 1; color: #fff; background: rgba(12, 14, 18, .78); border: 1px solid rgba(255, 255, 255, .35); cursor: pointer; }
+.map-x:hover, .map-x.on { background: var(--danger); border-color: var(--danger); }
+.status .changed { color: var(--accent); border: 1px solid var(--accent); }
+.status .status-marked { font-weight: 600; color: var(--danger); }

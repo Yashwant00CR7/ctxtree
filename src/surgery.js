@@ -13,7 +13,8 @@ import { forkSession, ForkError } from './fork.js';
 import { bootInventory } from './boot.js';
 import { structureInfo } from './restructure.js';
 import { tokFor } from './model.js';
-import { anchoredTok } from './map.js';
+import { anchoredTok, contextMap } from './map.js';
+import { dropRecs } from '../plugins/ctxtree/core/map.js';
 
 const TOMBSTONED = '[ctxtree: removed';
 
@@ -102,12 +103,18 @@ export function nodePlan(model, sid, { cat = '', sub = '', leaf = '', minTok = 0
   return { kind: 'none', label: cat, items: [], tok: 0, note: why[cat] || 'Nothing here can be deleted from a fork.', session: s.sid };
 }
 
-/** The one write path the UI uses: edits + tombstones + boot + structure, in one verified fork. */
-export function applySurgery(model, { sid, edits = [], boot = [], structure = [], note = '', dryRun = false }) {
+/**
+ * The one write path the UI uses, in one verified fork: hard deletes (`drop`:
+ * the map's unit keys), edits (an image out of a message: op 'remove'), boot
+ * removals and structural ops.
+ */
+export function applySurgery(model, { sid, edits = [], drop = [], boot = [], structure = [], note = '', dryRun = false }) {
   const s = model.sessions.find(x => x.sid === sid);
   if (!s) throw new ForkError('Session not found.');
   const clean = (edits || []).map(e => ({ id: e.id, fp: e.fp, newText: e.newText, op: e.op }));
-  const ops = (structure || []).map(o => (o && o.op === 'switch' ? { op: 'switch', tip: String(o.tip || '') } : { op: String(o && o.op) }));
+  const ops = (structure || []).filter(o => o && o.op !== 'drop').map(o => (o.op === 'switch' ? { op: 'switch', tip: String(o.tip || '') } : { op: String(o.op) }));
+  // the units are read off the map of the file as it is now, not as the page saw it
+  if (drop && drop.length) ops.push({ op: 'drop', recs: dropRecs(contextMap(model, sid), drop.map(String)) });
   const kinds = [clean.length && 'edit', boot.length && 'boot', ...ops.map(o => o.op)].filter(Boolean);
   return forkSession(s, clean, { tok: anchoredTok(model, s), note, dryRun, boot: [...new Set(boot)], structure: ops, kind: kinds.length === 1 ? kinds[0] : 'surgery' });
 }

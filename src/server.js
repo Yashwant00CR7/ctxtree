@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { ForkError } from './fork.js';
+import { execFile } from 'node:child_process';
+import { ForkError, listForks } from './fork.js';
+import { PROJECTS_DIR } from './paths.js';
+import { vtowerLink } from '../plugins/ctxtree/core/fork.js';
 import { UUID_RE } from './session.js';
 import { build } from './model.js';
 import { buildTree, projectBreakdown } from './tree.js';
@@ -11,7 +14,7 @@ import { buildRegions } from './regions.js';
 import { findings } from './findings.js';
 import { pruneSession, getLineage, revertFork } from './prune.js';
 import { bootView, structureView, nodePlan, applySurgery } from './surgery.js';
-import { contextMap, blockPreview, sessionTitle } from './map.js';
+import { contextMap, blockPreview, timeline, sessionTitle } from './map.js';
 import {
   getSessionContext,
   saveEditedSessionContext,
@@ -37,6 +40,11 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
+// vTower (macOS) handles vtower:// links; it lives in an Applications folder.
+const VTOWER_APPS = ['/Applications/vTower.app', path.join(process.env.HOME || '', 'Applications', 'vTower.app')];
+export const vtowerInstalled = () => process.platform === 'darwin' && VTOWER_APPS.some(p => fs.existsSync(p));
+export { vtowerLink };
+
 export class CtxServer {
   constructor(options = {}) {
     this.port = options.port || 3888;
@@ -47,9 +55,29 @@ export class CtxServer {
     this.model = null;
     this.cachedFindings = null;
     this.server = null;
+    // Sessions change while the page is open (you keep working, a fork is
+    // resumed): a watcher marks the model stale and bumps `version`, which the
+    // page polls. The rebuild is incremental (scan.js), so it is cheap.
+    this.version = 1;
+    this.stale = false;
+    this.watcher = null;
+  }
+
+  watch() {
+    let t = null;
+    try {
+      this.watcher = fs.watch(PROJECTS_DIR, { recursive: true }, (_ev, name) => {
+        if (name && !String(name).endsWith('.jsonl')) return;
+        this.stale = true;
+        clearTimeout(t);
+        t = setTimeout(() => { this.version++; }, 600);
+      });
+      this.watcher.on('error', () => { this.watcher = null; });
+    } catch { this.watcher = null; }   // no recursive watch here: refresh still works
   }
 
   ensureModel(force = false) {
+    if (this.stale) { force = true; this.stale = false; }
     if (!this.model || force) {
       console.log('Building ctxtree model...');
       const t0 = Date.now();
@@ -62,6 +90,7 @@ export class CtxServer {
 
   start() {
     this.ensureModel();
+    this.watch();
 
     return new Promise((resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
@@ -93,6 +122,7 @@ export class CtxServer {
   }
 
   stop() {
+    if (this.watcher) { this.watcher.close(); this.watcher = null; }
     return new Promise((resolve) => {
       if (this.server) this.server.close(resolve);
       else resolve();
@@ -443,7 +473,15 @@ export class CtxServer {
       if (pathname === '/api/block' && method === 'GET') {
         const sid = parsedUrl.searchParams.get('sid');
         if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
-        return sendJson(blockPreview(model, sid, parsedUrl.searchParams.get('id')));
+        const q = parsedUrl.searchParams;
+        const limit = q.get('full') === '1' ? Infinity : undefined;
+        return sendJson(blockPreview(model, sid, q.get('id'), { offset: Number(q.get('offset')) || 0, limit }));
+      }
+
+      if (pathname === '/api/timeline' && method === 'GET') {
+        const sid = parsedUrl.searchParams.get('sid');
+        if (!sid || sid === 'all') return sendJson({ error: 'Missing sid' }, 400);
+        return sendJson(timeline(model, sid, parsedUrl.searchParams.get('id')));
       }
 
       if (pathname === '/api/boot' && method === 'GET') {
@@ -461,12 +499,35 @@ export class CtxServer {
       // One verified fork for everything in the delete queue.
       if (pathname === '/api/fork' && method === 'POST') {
         const body = await readBody();
-        const { sid, edits, boot, structure, note, dryRun } = body;
+        const { sid, edits, drop, boot, structure, note, dryRun } = body;
         if (!sid) return sendJson({ error: 'sid is required' }, 400);
-        if (![edits, boot, structure].every(x => x === undefined || Array.isArray(x))) return sendJson({ error: 'edits, boot and structure must be arrays' }, 400);
-        const resData = applySurgery(model, { sid, edits, boot, structure, note, dryRun: dryRun === true });
+        if (![edits, drop, boot, structure].every(x => x === undefined || Array.isArray(x))) return sendJson({ error: 'edits, drop, boot and structure must be arrays' }, 400);
+        const resData = applySurgery(model, { sid, edits, drop, boot, structure, note, dryRun: dryRun === true });
         if (!resData.dryRun) this.ensureModel(true);
         return sendJson(resData);
+      }
+
+      // What the page polls: bumps when a session file changes.
+      if (pathname === '/api/version' && method === 'GET') {
+        return sendJson({ version: this.version, watching: !!this.watcher });
+      }
+
+      if (pathname === '/api/env' && method === 'GET') {
+        return sendJson({ vtower: vtowerInstalled() });
+      }
+
+      // Open a fork in a new vTower tab: vtower://resume/<uuid>?cwd=<folder>.
+      // vTower checks both and runs ctxtree's own resume command there. The link
+      // names only the session and its folder, never a command.
+      if (pathname === '/api/open-fork' && method === 'POST') {
+        const { forkSid } = await readBody();
+        if (!UUID_RE.test(forkSid || '')) return sendJson({ error: 'Invalid fork id.' }, 400);
+        const f = listForks().find(x => x.forkSid === forkSid);
+        if (!f || f.exists === false) return sendJson({ error: 'Not a ctxtree fork on this machine.' }, 404);
+        if (!vtowerInstalled()) return sendJson({ error: 'vTower is not installed.', resumeCmd: f.resumeCmd }, 409);
+        const url = vtowerLink(f.forkSid, f.cwd);
+        await new Promise((resolve, reject) => execFile('open', [url], (err) => (err ? reject(new ForkError(`Could not open vTower: ${err.message}`)) : resolve())));
+        return sendJson({ ok: true, url });
       }
 
       if (pathname === '/api/refresh' && method === 'POST') {
